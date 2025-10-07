@@ -1,5 +1,4 @@
 # ViTCIFAR-Lightning-Example
-Repo displaying good pipeline design using lightning to focus on implementation rather than boilerplate
 
 ## Run in Docker
 
@@ -51,7 +50,6 @@ class VisionTransformer(nn.Module):
 - Scheduler: `sched.name=cosine`
 - Loss: `loss.name=cross_entropy`
 
-This avoids fragile `_target_` strings and makes swapping components trivial.
 
 ### Notes
 
