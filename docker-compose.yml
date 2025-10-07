@@ -20,5 +20,24 @@ services:
     gpus: all              # enable NVIDIA GPUs
     entrypoint: ["/usr/bin/tini", "--", "python", "-m", "src.train_lightning"]
 
+  tune-optuna:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        USER_ID: ${UID:-1000}
+        GROUP_ID: ${GID:-1000}
+    image: cifar10-vit:dev
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - pip-cache:/home/appuser/.cache/pip
+    environment:
+      - DATA_ROOT=/workspace/data
+      - OUTPUT_DIR=/workspace/output
+    shm_size: "8g"
+    gpus: all
+    entrypoint: ["/usr/bin/tini", "--", "python", "-m", "src.tune_optuna"]
+
 volumes:
   pip-cache:

@@ -27,12 +27,12 @@ import src.optimizers  # noqa: F401
 import src.losses  # noqa: F401
 from src.utils.mixup_scheduler import MixupCutmixScheduler
 
-@hydra.main(version_base=None, config_path="../configs", config_name="config")
-def main(cfg: DictConfig):
+def run_training(cfg: DictConfig, work_dir: Path | None = None, artifacts: bool = True) -> dict:
     print(OmegaConf.to_yaml(cfg))
     # Persist resolved config in the Hydra run dir (cwd is already the run dir)
     try:
-        Path("config_dump.yaml").write_text(OmegaConf.to_yaml(cfg))
+        if artifacts:
+            Path("config_dump.yaml").write_text(OmegaConf.to_yaml(cfg))
     except Exception:
         pass
     set_seed(cfg.seed)
@@ -113,22 +113,33 @@ def main(cfg: DictConfig):
     )
 
     # Resolve Hydra run directory
-    run_dir = Path(HydraConfig.get().runtime.output_dir)
+    base_run_dir = Path(HydraConfig.get().runtime.output_dir)
+    run_dir = Path(work_dir) if work_dir is not None else base_run_dir
 
-    # TensorBoard logger -> run_dir/tb/version_0
-    tb_logger = TensorBoardLogger(save_dir=str(run_dir), name="tb")
+    # TensorBoard logger toggle
+    log_cfg = getattr(cfg, "logging", {})
+    enable_tb = bool(getattr(log_cfg, "enable_tb", True))
+    tb_name = str(getattr(log_cfg, "tb_name", "tb"))
+    tb_logger = TensorBoardLogger(save_dir=str(run_dir), name=tb_name) if enable_tb else False
 
     # Checkpoints -> run_dir/ckpts
+    ckpt_cfg = getattr(cfg, "checkpoint", {})
+    ckpt_enable = bool(getattr(ckpt_cfg, "enable", True))
+    ckpt_monitor = str(getattr(ckpt_cfg, "monitor", "val_acc"))
+    ckpt_mode = str(getattr(ckpt_cfg, "mode", "max"))
+    ckpt_save_top_k = int(getattr(ckpt_cfg, "save_top_k", 3))
+    ckpt_cb = None
     ckpt_dir = run_dir / "ckpts"
-    ckpt_cb = ModelCheckpoint(
-        dirpath=str(ckpt_dir),
-        filename="epoch{epoch:02d}-valacc{val_acc:.4f}",
-        monitor="val_acc",
-        mode="max",
-        save_top_k=3,
-        save_last=True,
-        auto_insert_metric_name=False,
-    )
+    if ckpt_enable:
+        ckpt_cb = ModelCheckpoint(
+            dirpath=str(ckpt_dir),
+            filename="epoch{epoch:02d}-valacc{val_acc:.4f}",
+            monitor=ckpt_monitor,
+            mode=ckpt_mode,
+            save_top_k=ckpt_save_top_k,
+            save_last=True if ckpt_save_top_k != 0 else False,
+            auto_insert_metric_name=False,
+        )
 
     # Precision with bf16 fallback if unsupported
     requested_precision = str(cfg.precision)
@@ -160,7 +171,9 @@ def main(cfg: DictConfig):
         )
 
     # Build callbacks list
-    callbacks = [ckpt_cb, OneBasedTQDMProgressBar(refresh_rate=1)]
+    callbacks = [OneBasedTQDMProgressBar(refresh_rate=1)]
+    if ckpt_cb is not None:
+        callbacks.insert(0, ckpt_cb)
     if bool(getattr(cfg.trainer, "lr_monitor", True)):
         callbacks.append(LearningRateMonitor(logging_interval="epoch"))
 
@@ -203,6 +216,7 @@ def main(cfg: DictConfig):
         accumulate_grad_batches=getattr(cfg.trainer, "accumulate_grad_batches", 1),
         logger=tb_logger,
         callbacks=callbacks,
+        enable_progress_bar=bool(getattr(cfg.trainer, "enable_progress_bar", True)),
     )
 
     # Track total pipeline runtime (training + evaluation)
@@ -211,18 +225,19 @@ def main(cfg: DictConfig):
     trainer.test(lit, datamodule=datamodule)
     _total_time_sec = float(time.perf_counter() - _pipeline_t0)
 
-    # After training: export best bundle under run_dir/best
+    # After training: optionally export artifacts
     best_dir = run_dir / "best"
-    best_dir.mkdir(parents=True, exist_ok=True)
+    best_ckpt_path = None
+    if artifacts:
+        best_dir.mkdir(parents=True, exist_ok=True)
+        if ckpt_cb is not None:
+            best_ckpt_path = Path(ckpt_cb.best_model_path) if ckpt_cb.best_model_path else None
+            if best_ckpt_path and best_ckpt_path.exists():
+                shutil.copy2(best_ckpt_path, best_dir / best_ckpt_path.name)
+        # Export plain .pt state_dict for non-Lightning loading
+        torch.save(lit.model.state_dict(), best_dir / "model.pt")
 
-    best_ckpt_path = Path(ckpt_cb.best_model_path) if ckpt_cb.best_model_path else None
-    if best_ckpt_path and best_ckpt_path.exists():
-        shutil.copy2(best_ckpt_path, best_dir / best_ckpt_path.name)
-
-    # Export plain .pt state_dict for non-Lightning loading
-    torch.save(lit.model.state_dict(), best_dir / "model.pt")
-
-    # Write summary.json with key metrics and paths
+    # Build summary with key metrics and paths
     metrics = {}
     for k, v in trainer.callback_metrics.items():
         try:
@@ -240,7 +255,7 @@ def main(cfg: DictConfig):
     # Collect top-k checkpoints and scores from the callback (best_k_models)
     top_k_entries = []
     try:
-        best_k_models = getattr(ckpt_cb, "best_k_models", {}) or {}
+        best_k_models = getattr(ckpt_cb, "best_k_models", {}) or {} if ckpt_cb is not None else {}
         mode = getattr(ckpt_cb, "mode", "max")
         sortable = [
             {"filename": Path(path).name, "score": float(score)}
@@ -252,7 +267,7 @@ def main(cfg: DictConfig):
         top_k_entries = []
     summary = {
         "best_checkpoint": best_ckpt_path.name if (best_ckpt_path and best_ckpt_path.exists()) else None,
-        "best_score": float(ckpt_cb.best_model_score) if ckpt_cb.best_model_score is not None else None,
+        "best_score": float(ckpt_cb.best_model_score) if (ckpt_cb is not None and ckpt_cb.best_model_score is not None) else metrics.get("val_acc"),
         "tb_dir": str(run_dir / "tb"),
         "ckpt_dir": str(ckpt_dir),
         "metrics": metrics,
@@ -264,7 +279,13 @@ def main(cfg: DictConfig):
         # Total runtime
         "total_time_sec": _total_time_sec,
     }
-    (best_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+    if artifacts:
+        (best_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+    return summary
+
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
+def main(cfg: DictConfig):
+    run_training(cfg)
 
 if __name__ == "__main__":
     main()

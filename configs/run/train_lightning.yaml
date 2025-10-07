@@ -1,3 +1,13 @@
 # Convenience: no-op run recipe (room for future run-dir tweaks)
 defaults:
   - _self_
+
+logging:
+  enable_tb: true
+  tb_name: tb
+
+checkpoint:
+  enable: true
+  save_top_k: 3
+  monitor: val_acc
+  mode: max

@@ -1,0 +1,44 @@
+defaults:
+  - _self_
+
+# Optuna study settings
+direction: maximize
+metric: val_acc
+n_trials: 6
+timeout: null
+seed: 42
+pruning: false
+sampler: tpe
+top_k: 3
+
+# Quick-test runtime knobs
+trial_max_epochs: 5
+minimal_logging: true
+
+# Parameter search space (Hydra keys)
+params:
+  - key: optim.lr
+    type: loguniform
+    low: 5e-5
+    high: 5e-3
+  - key: optim.weight_decay
+    type: loguniform
+    low: 1e-5
+    high: 2e-1
+  - key: data.collator.mixup_alpha
+    type: uniform
+    low: 0.0
+    high: 0.8
+  - key: data.collator.cutmix_alpha
+    type: uniform
+    low: 0.0
+    high: 1.0
+  - key: model.dropout
+    type: uniform
+    low: 0.0
+    high: 0.3
+  - key: model.attn_dropout
+    type: uniform
+    low: 0.0
+    high: 0.3
+

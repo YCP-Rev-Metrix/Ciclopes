@@ -3,3 +3,4 @@ hydra-core>=1.3
 omegaconf>=2.3
 torchvision>=0.19
 tensorboard
+optuna>=3.6
