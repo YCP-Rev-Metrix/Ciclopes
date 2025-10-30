@@ -1,6 +1,6 @@
 defaults:
-  - exp: cifar10_train
-  - trainer: sl
+  - exp: yolo_seg_train
+  - trainer: yolo_seg_trainer
   - modes: train
   - speed: default
   - seed: default

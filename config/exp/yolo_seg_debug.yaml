@@ -1,0 +1,11 @@
+# YOLO segmentation debug experiment (1 epoch)
+
+exp:
+  name: yolo_seg_debug
+  desc: YOLOv11 segmentation smoke test (1 epoch)
+  tags: [yolo, segmentation, debug]
+  notes: "Single epoch run to validate data + pipeline"
+
+trainer:
+  mode: debug
+

@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       git curl ca-certificates \
       build-essential g++ gcc \
       libgl1-mesa-glx libglfw3 libosmesa6 libglew-dev patchelf \
+      libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

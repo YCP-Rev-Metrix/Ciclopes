@@ -1,0 +1,10 @@
+# YOLO segmentation full training experiment
+
+exp:
+  name: yolo_seg_train
+  desc: YOLOv11 segmentation full training run
+  tags: [yolo, segmentation, production]
+  notes: "High-resolution training on yolo_dataset_v1"
+
+trainer:
+  mode: train

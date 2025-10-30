@@ -22,6 +22,9 @@ scipy>=1.11
 pyyaml>=6.0
 matplotlib>=3.8              # optional for debug viz
 
+# === YOLO ===
+ultralytics>=8.3.0           # YOLOv11 segmentation support
+
 # (Removed RL env helpers)
 
 # === Docker safety / reproducibility ===

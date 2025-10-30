@@ -1,0 +1,4 @@
+trainer:
+  name: yolo_seg
+  mode: train
+

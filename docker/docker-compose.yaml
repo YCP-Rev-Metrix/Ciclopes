@@ -18,7 +18,7 @@ x-trainer-common: &trainer-common
   volumes:
     - ../:/app
     - ../outputs:/app/outputs
-  shm_size: 2gb
+  shm_size: 8gb            # Large shared memory for PyTorch multiprocessing with YOLO
   environment:
     - MUJOCO_GL=egl
     - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
