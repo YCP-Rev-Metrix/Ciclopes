@@ -137,6 +137,7 @@ class YOLOSegTrainer(BaseTrainer):
         batch_size = int(train_args.get("batch", 4))
         imgsz = int(train_args.get("imgsz", 640))
         workers = int(train_args.get("workers", 4))
+        cache = train_args.get("cache", "ram")
 
         # Device selection (single GPU assumed; can be extended easily)
         if self.device.type == "cuda":
@@ -153,6 +154,7 @@ class YOLOSegTrainer(BaseTrainer):
                 "project": str(project_dir),
                 "name": exp_name,
                 "workers": workers,
+                "cache": cache,
             }
         )
 

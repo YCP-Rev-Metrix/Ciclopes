@@ -4,9 +4,10 @@ data_yaml: data/yolo_dataset_v1/data.yaml
 seed: 42
 train_args:
   epochs: 10
-  batch: 12
+  batch: 4
   imgsz: 2048
-  workers: 4
+  workers: 12
+  cache: "disk"
   lr0: 0.012
   lrf: 0.01
   momentum: 0.937

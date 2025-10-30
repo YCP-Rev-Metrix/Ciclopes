@@ -6,7 +6,8 @@ train_args:
   epochs: 5
   batch: 8
   imgsz: 1280
-  workers: 6
+  workers: 10
+  cache: "ram"
   lr0: 0.01
   lrf: 0.01
   momentum: 0.937

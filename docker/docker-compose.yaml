@@ -32,8 +32,6 @@ services:
     # Default runs your selected exp from config/defaults.yaml
     command: ["python", "scripts/train.py"]
 
-  # (Optional) define a SEARCH profile you can enable later
-  # For now it's just a TODO placeholder—no Optuna wiring yet.
   search:
     <<: *trainer-common
     profiles: ["search"]

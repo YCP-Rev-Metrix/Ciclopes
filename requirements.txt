@@ -20,12 +20,10 @@ numpy>=1.24
 pandas>=2.0
 scipy>=1.11
 pyyaml>=6.0
-matplotlib>=3.8              # optional for debug viz
+matplotlib>=3.8
 
 # === YOLO ===
 ultralytics>=8.3.0           # YOLOv11 segmentation support
-
-# (Removed RL env helpers)
 
 # === Docker safety / reproducibility ===
 # versions below ensure deterministic builds
