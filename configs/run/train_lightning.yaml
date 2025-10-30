@@ -1,3 +1,0 @@
-# Convenience: no-op run recipe (room for future run-dir tweaks)
-defaults:
-  - _self_

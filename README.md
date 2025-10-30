@@ -1,60 +1,78 @@
-# ViTCIFAR-Lightning-Example
-Repo displaying good pipeline design using lightning to focus on implementation rather than boilerplate
+# Pipeline V4 Usage
 
-## Run in Docker
+## Prerequisites
+- Docker with NVIDIA GPU support (Linux: nvidia-container-toolkit; Windows: WSL2 + Docker Desktop + GPU enabled).
+- Python 3.11+ for local runs (optional; Docker handles deps).
 
-Build the image (first time or after dependency changes):
-
+## Build Image
+Build once for Docker usage:
 ```bash
-docker compose build --no-cache
+# Linux/macOS
+BASE_IMAGE=pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime docker compose -f docker/docker-compose.yaml build --no-cache
+
+# Windows PowerShell
+$env:BASE_IMAGE="pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime"; docker compose -f docker/docker-compose.yaml build --no-cache
 ```
+Omit `BASE_IMAGE` for default.
 
-Start a training run with the base defaults:
+## Run Training (Local or Container)
+Outputs go to `outputs/${exp.name}/${modes.mode}/${now:%Y%m%d_%H%M%S}/reports/` (config, metrics.jsonl, checkpoints, etc.).
 
+### Local (Host)
 ```bash
-docker compose run --rm train-lightning
+# Standard CIFAR-10 SL training
+python -m scripts.train exp=cifar10_train
+
+# Quick debug
+python -m scripts.train exp=quick_debug_sl
 ```
 
-### Switch experiments (Hydra groups)
-
-Experiments are Hydra groups registered via ConfigStore. Select them by name:
-
+### Container (Recommended for GPU/Isolation)
+From project root:
 ```bash
-# Default (vit_cifar10)
-docker compose run --rm train-lightning
-
-# Quick debug run (smaller batch, few epochs)
-docker compose run --rm train-lightning exp=quick_debug
+cd docker
+docker-compose up -d trainer  # Runs python scripts/train.py (default exp)
 ```
-
-You can also override any field at the CLI:
-
+Override exp:
 ```bash
-docker compose run --rm train-lightning exp=vit_cifar10 io.batch_size=256 trainer.devices=1
+cd docker
+docker-compose run --rm trainer python -m scripts.train exp=cifar10_train
 ```
 
-### Registry-based components
+## Evaluate
+```bash
+# Local
+python -m scripts.eval exp=cifar10_eval
 
-Models, datamodules, optimizers, schedulers, and losses are resolved via simple registries with decorators:
-
-```python
-from src.registry import register_model
-
-@register_model("vit")
-class VisionTransformer(nn.Module):
-    ...
+# Container
+cd docker && docker-compose run --rm eval  # Runs python scripts/eval.py
 ```
 
-- Model: `model.name=vit`
-- Data: `data.name=cifar10`
-- Optimizer: `optim.name=adamw`
-- Scheduler: `sched.name=cosine`
-- Loss: `loss.name=cross_entropy`
+## Hyperparameter Search (Optuna)
+```bash
+# Local multirun
+python -m scripts.search -m +hpo=optuna +hpo_space=space_sl_basic exp=cifar10_train hydra.sweeper.n_trials=50
 
-This avoids fragile `_target_` strings and makes swapping components trivial.
+# Container
+cd docker && docker-compose run --rm search  # Example: +hpo=optuna +hpo_space=space_sl_basic
+```
+Results in per-trial run dirs with topk.json summary.
 
-### Notes
+## Interactive Shell
+GPU-enabled shell with mounted source:
+```bash
+cd docker && docker-compose run --rm trainer bash
+```
+Inside: `python -m scripts.train exp=quick_debug_sl` or `pytest`.
 
-- Hydra output directories default under `./output` or `${OUTPUT_DIR}` if set.
-- The script prints the resolved config on start.
-- For a full error stack, set `HYDRA_FULL_ERROR=1`.
+## Monitor Logs
+- Local: Watch terminal (progress bars + metrics).
+- Container: `docker-compose logs -f trainer` (from docker dir).
+
+## Troubleshooting
+- GPU not available? Run `docker-compose run --rm trainer nvidia-smi` to check.
+- Interpolation errors? Ensure Hydra overrides are correct (e.g., `exp=...`).
+- Data missing? CIFAR-10 downloads to `./data` on first run (no copying to outputs).
+- Rebuild if deps change: `docker compose build --no-cache`.
+
+For custom exps, edit `config/exp/*.yaml` and rerun.

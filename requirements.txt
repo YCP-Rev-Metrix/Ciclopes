@@ -1,5 +1,29 @@
-lightning>=2.4
-hydra-core>=1.3
-omegaconf>=2.3
-torchvision>=0.19
-tensorboard
+# === Core ===
+# Use torch/vision/audio from the base image to keep CUDA compatibility
+
+torchvision>=0.15
+
+# === Hydra & HPO ===
+hydra-core==1.3.*
+omegaconf==2.3.*
+hydra-optuna-sweeper==1.2.0
+optuna>=2.10.1,<3.0.0        # pinned for hydra-optuna-sweeper 1.2.0 compatibility
+SQLAlchemy<2.0
+
+
+# === Logging ===
+tqdm==4.*
+rich==13.*
+
+# === Data / Utils ===
+numpy>=1.24
+pandas>=2.0
+scipy>=1.11
+pyyaml>=6.0
+matplotlib>=3.8              # optional for debug viz
+
+# (Removed RL env helpers)
+
+# === Docker safety / reproducibility ===
+# versions below ensure deterministic builds
+protobuf<5.0
