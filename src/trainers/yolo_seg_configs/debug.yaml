@@ -3,7 +3,7 @@ run_name: yolo_seg_debug
 data_yaml: data/yolo_dataset_v1/data.yaml
 seed: 42
 train_args:
-  epochs: 1
+  epochs: 5
   batch: 8
   imgsz: 1280
   workers: 6
