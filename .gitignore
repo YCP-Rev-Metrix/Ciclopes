@@ -20,3 +20,4 @@
 DEPENDENCY_RESOLUTION.md
 OPTIMIZATION_SUMMARY.md
 
+/postprocessing/__pycache__

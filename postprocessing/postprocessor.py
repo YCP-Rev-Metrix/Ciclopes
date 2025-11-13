@@ -8,17 +8,10 @@ from typing import Dict, Tuple, Optional, List
 # ---------- Geometry / Warping ----------
 
 class Warp:
-    """
-    Geometry helpers for BEV homography and mask warping.
-    All methods are stateless and functional (staticmethods).
-    """
+    pass
 
     @staticmethod
     def compute_homography(src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray:
-        """
-        Compute 3x3 homography H such that  dst ~ H * src.
-        src_pts, dst_pts: shape (N, 2), N>=4, float32/64.
-        """
         H, status = cv2.findHomography(src_pts, dst_pts, method=cv2.RANSAC)
         if H is None:
             raise RuntimeError("cv2.findHomography failed. Check your correspondences.")
@@ -26,19 +19,12 @@ class Warp:
 
     @staticmethod
     def warp_mask(mask: np.ndarray, H: np.ndarray, out_size: Tuple[int, int]) -> np.ndarray:
-        """
-        Warp a single-channel mask with nearest-neighbor to preserve labels.
-        out_size = (width, height) for cv2.warpPerspective.
-        """
         if mask.ndim == 3:
             mask = mask.squeeze()
         return cv2.warpPerspective(mask, H, out_size, flags=cv2.INTER_NEAREST)
 
     @staticmethod
     def image_to_bev_point(pt_xy: Tuple[float, float], H: np.ndarray) -> Optional[Tuple[float, float]]:
-        """
-        Apply homography to a single (x, y) point. Returns (x', y') in BEV (float).
-        """
         x, y = pt_xy
         vec = np.array([x, y, 1.0], dtype=np.float64).reshape(3, 1)
         dst = H @ vec
@@ -49,10 +35,6 @@ class Warp:
 
     @staticmethod
     def centroid_from_mask(mask: np.ndarray) -> Optional[Tuple[float, float]]:
-        """
-        Centroid of nonzero pixels, in (x, y) pixel coordinates.
-        Returns None if the mask is empty.
-        """
         ys, xs = np.where(mask > 0)
         if xs.size == 0:
             return None
@@ -62,10 +44,6 @@ class Warp:
 
     @staticmethod
     def _order_corners_clockwise(pts: np.ndarray) -> np.ndarray:
-        """
-        Order 4 points as: top-left, top-right, bottom-right, bottom-left.
-        pts: (4,2)
-        """
         pts = np.asarray(pts, dtype=np.float32)
         s = pts.sum(axis=1)
         d = np.diff(pts, axis=1).ravel()
@@ -78,15 +56,6 @@ class Warp:
 
     @staticmethod
     def quad_from_lane_mask(lane_mask: np.ndarray) -> Optional[np.ndarray]:
-        """
-        Find a 4-corner polygon describing the lane in the first frame.
-        Strategy:
-          - largest external contour
-          - approxPolyDP to 4 corners
-          - fallback to minAreaRect box if approx fails
-
-        Returns (4,2) float32 corners in image pixels or None if not found.
-        """
         if lane_mask.ndim == 3:
             lane_mask = lane_mask.squeeze()
 
@@ -115,10 +84,6 @@ class Warp:
 
     @staticmethod
     def default_bev_corners(out_size: Tuple[int, int]) -> np.ndarray:
-        """
-        Construct a canonical rectangle in BEV space with the requested output size.
-        out_size = (W, H) in BEV pixels (or arbitrary units).
-        """
         W, H = out_size
         return np.array([[0, 0],
                          [W - 1, 0],
@@ -129,9 +94,7 @@ class Warp:
 # ---------- Temporal buffer & kinematics ----------
 
 class BufferCalcs:
-    """
-    Keep a rolling buffer of BEV positions and compute velocity & acceleration via finite differences.
-    """
+    pass
 
     def __init__(self, buffer_len: int = 12, dt: float = 1.0 / 30.0):
         self.buffer_len = int(buffer_len)
@@ -193,23 +156,7 @@ class ProcessResult:
 
 
 class PostProcessor:
-    """
-    One-run pipeline:
-      - compute H once (from the first lane mask, or from provided correspondences),
-      - warp masks to BEV,
-      - compute centroid, velocity, acceleration.
-
-    Usage:
-        pp = PostProcessor(out_size=(W, H), dt=1/60.0)
-        results, H = pp.process_run(
-            masks_by_index={
-                0: {"ball": ball0, "lane": lane0},
-                1: {"ball": ball1, "lane": lane1},
-                ...
-            },
-            homography_src_dst=None                # OR supply (src_pts, dst_pts) to override auto-H
-        )
-    """
+    pass
 
     def __init__(self,
                  out_size: Tuple[int, int] = (400, 800),
@@ -241,14 +188,6 @@ class PostProcessor:
         masks_by_index: Dict[int, Dict[str, np.ndarray]],
         homography_src_dst: Optional[Tuple[np.ndarray, np.ndarray]] = None
     ) -> Tuple[Dict[int, ProcessResult], np.ndarray]:
-        """
-        masks_by_index: { idx: {"ball": ball_mask, "lane": lane_mask}, ... }
-        homography_src_dst: optional (src_pts, dst_pts) to override auto-H from lane mask.
-
-        Returns:
-            (results_by_index, H)
-            where results_by_index[idx] = ProcessResult(...)
-        """
         if not masks_by_index:
             return {}, np.eye(3, dtype=np.float64)
 
