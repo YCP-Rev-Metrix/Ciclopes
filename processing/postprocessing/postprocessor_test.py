@@ -9,7 +9,7 @@ import pytest
 import logging
 from datetime import datetime
 
-from postprocessing.postprocessor import PostProcessor, ProcessResult
+from processing.postprocessing.postprocessor import PostProcessor, ProcessResult
 
 
 def _project_root() -> Path:

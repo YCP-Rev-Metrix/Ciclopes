@@ -155,6 +155,24 @@ class ProcessResult:
     warped_ball: np.ndarray
 
 
+@dataclass
+class LaneMetrics:
+    """
+    Summary metrics for a single lane run in BEV space.
+
+    All distances and speeds are expressed in BEV units; tests or downstream
+    consumers can map them to world coordinates using the homography-derived
+    calibration used elsewhere in the project.
+    """
+
+    fractions: Tuple[float, ...]
+    frac_positions: Tuple[float, ...]
+    velocity_at_frac: Tuple[Tuple[float, float, float], ...]  # (vx, vy, |v|)
+    acceleration_at_frac: Tuple[Tuple[float, float, float], ...]  # (ax, ay, |a|)
+    total_break: float  # lateral |pos_end - pos_start|
+    end_lane_speed: float
+
+
 class PostProcessor:
     pass
 
@@ -163,7 +181,8 @@ class PostProcessor:
                  dt: float = 1.0 / 30.0,
                  buffer_len: int = 12):
         self.out_size = (int(out_size[0]), int(out_size[1]))
-        self.buffer = BufferCalcs(buffer_len=buffer_len, dt=dt)
+        self.dt = float(dt)
+        self.buffer = BufferCalcs(buffer_len=buffer_len, dt=self.dt)
 
     def _compute_H_once(
         self,
@@ -223,3 +242,98 @@ class PostProcessor:
             )
 
         return results, H
+
+    # ------------------------------------------------------------------
+    # Higher-level lane metrics for test evaluation
+    # ------------------------------------------------------------------
+    def compute_lane_metrics(
+        self,
+        results_by_index: Dict[int, ProcessResult],
+        fractions: Tuple[float, ...] = (0.25, 0.5, 0.75, 1.0),
+    ) -> LaneMetrics:
+        """
+        Compute velocity/acceleration at fixed fractions along the lane,
+        total break (lateral offset from start to end), and end-of-lane speed.
+
+        We treat the dominant BEV axis of motion (x or y) as the lane axis and
+        the other axis as lateral. This is consistent with how tests currently
+        recover a 1D coordinate along the lane from BEV centroids.
+        """
+        if not results_by_index:
+            raise ValueError("results_by_index is empty")
+
+        # Collect BEV centroids in temporal order, skipping missing ones.
+        idxs = sorted(results_by_index.keys())
+        traj: List[Tuple[float, float]] = []
+        for i in idxs:
+            c = results_by_index[i].bev_centroid
+            if c is not None:
+                traj.append(c)
+
+        if len(traj) < 2:
+            raise ValueError("Not enough valid centroids to compute metrics")
+
+        bev = np.array(traj, dtype=np.float64)
+        xs = bev[:, 0]
+        ys = bev[:, 1]
+
+        # Choose primary axis as the one with larger dynamic range.
+        range_x = float(xs.max() - xs.min())
+        range_y = float(ys.max() - ys.min())
+        primary_axis = 0 if range_x >= range_y else 1
+
+        s = xs if primary_axis == 0 else ys  # along-lane coordinate
+        l = ys if primary_axis == 0 else xs  # lateral coordinate
+
+        # Ensure s increases along the lane for simpler fraction logic.
+        if s[-1] < s[0]:
+            s = -s
+
+        lane_len = float(s[-1] - s[0])
+        if lane_len <= 0.0:
+            raise ValueError("Non-positive lane length in BEV coordinates")
+
+        # Finite-difference velocities and accelerations in BEV space.
+        dt = self.dt
+        vs = np.gradient(s, dt)
+        vl = np.gradient(l, dt)
+        ax = np.gradient(vs, dt)
+        ay = np.gradient(vl, dt)
+
+        frac_list = []
+        frac_positions = []
+        vel_at_frac = []
+        acc_at_frac = []
+
+        for f in fractions:
+            f_clamped = float(max(0.0, min(1.0, f)))
+            target_s = s[0] + f_clamped * lane_len
+            idx_closest = int(np.argmin(np.abs(s - target_s)))
+
+            vx_f = float(vs[idx_closest])
+            vy_f = float(vl[idx_closest])
+            ax_f = float(ax[idx_closest])
+            ay_f = float(ay[idx_closest])
+
+            speed_f = float(np.hypot(vx_f, vy_f))
+            acc_mag_f = float(np.hypot(ax_f, ay_f))
+
+            frac_list.append(f_clamped)
+            frac_positions.append(float(s[idx_closest]))
+            vel_at_frac.append((vx_f, vy_f, speed_f))
+            acc_at_frac.append((ax_f, ay_f, acc_mag_f))
+
+        # Total break: lateral deviation from start to end.
+        total_break = float(abs(l[-1] - l[0]))
+        # End-of-lane speed from last sample.
+        end_speed = float(np.hypot(vs[-1], vl[-1]))
+
+        return LaneMetrics(
+            fractions=tuple(frac_list),
+            frac_positions=tuple(frac_positions),
+            velocity_at_frac=tuple(vel_at_frac),
+            acceleration_at_frac=tuple(acc_at_frac),
+            total_break=total_break,
+            end_lane_speed=end_speed,
+        )
+
