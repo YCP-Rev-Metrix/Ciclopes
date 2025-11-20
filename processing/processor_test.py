@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+from collections import defaultdict
 import csv
 from datetime import datetime
 
 import cv2
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for headless environments
+import matplotlib.pyplot as plt
 
 from processing.preprocessing.preprocessor import YOLOSegPreprocessor, InferenceConfig
 from processing.postprocessing.postprocessor import PostProcessor, LaneMetrics, ProcessResult, Warp
@@ -251,6 +255,8 @@ def _format_csv_value(value, precision: int = 6):
     if isinstance(value, (int, np.integer)):
         return int(value)
     if isinstance(value, (float, np.floating)):
+        if np.isnan(value) or np.isinf(value):
+            return ""
         # Use scientific notation for very small or very large numbers
         if abs(value) < 1e-10 and value != 0:
             return f"{value:.2e}"
@@ -524,6 +530,63 @@ def _map_50_95_for_episode(pred_masks: dict[int, dict[str, np.ndarray]]) -> dict
     return maps
 
 
+def _frames_with_ball(results_by_index: Dict[int, ProcessResult]) -> Dict[int, ProcessResult]:
+    """Filter results to frames that contain a ball mask."""
+    out: Dict[int, ProcessResult] = {}
+    for k, res in results_by_index.items():
+        ball_mask = res.warped_ball
+        if ball_mask is not None and np.any(ball_mask > 0):
+            out[k] = res
+    return out
+
+
+def _episode_frame_ranges(gt_data: Dict[int, Dict[str, float]], labels_dir: Path) -> Dict[int, range]:
+    """
+    Derive per-episode frame ranges from available label files, aligned to GT if counts match.
+    Handles warm-up offset where (start-1) exists but GT starts later.
+    """
+    frames_by_ep: Dict[int, List[int]] = defaultdict(list)
+    for frame_idx, row in gt_data.items():
+        frames_by_ep[row["episode_idx"]].append(frame_idx)
+
+    available_frames_sorted = sorted({int(p.stem.strip("_")) for p in labels_dir.glob("*.txt")})
+    ranges: Dict[int, range] = {}
+
+    if available_frames_sorted:
+        # Build contiguous runs from available frames.
+        contiguous: List[range] = []
+        start = prev = available_frames_sorted[0]
+        for f in available_frames_sorted[1:]:
+            if f != prev + 1:
+                contiguous.append(range(start, prev + 1))
+                start = f
+            prev = f
+        contiguous.append(range(start, prev + 1))
+
+        gt_eps = sorted(frames_by_ep.keys())
+        if len(gt_eps) == len(contiguous) and len(gt_eps) > 0:
+            for ep, seg in zip(gt_eps, contiguous):
+                ranges[ep] = seg
+            return ranges
+
+    # Fallback: clamp GT min/max to available frames, allowing start-1 shift.
+    available_set = set(available_frames_sorted)
+    for ep, frames in frames_by_ep.items():
+        f_min, f_max = min(frames), max(frames)
+
+        if f_min not in available_set and (f_min - 1) in available_set:
+            f_min = f_min - 1
+
+        while f_min not in available_set and f_min <= f_max:
+            f_min += 1
+        while f_max not in available_set and f_max >= f_min:
+            f_max -= 1
+
+        ranges[ep] = range(f_min, f_max + 1)
+
+    return ranges
+
+
 class _DatasetBackedYOLO:
     """
     YOLO-like model whose `.predict()` loads masks from the
@@ -584,6 +647,7 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
     """
     data_dir = _test_data_dir()
     images_dir = data_dir / "images"
+    labels_dir = data_dir / "labels"
 
     # Load ground truth data
     gt_data = _load_ground_truth_csv()
@@ -598,10 +662,8 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
     csv_path, csv_writer, csv_file = _create_results_csv()
     print(f"\nLogging comprehensive test results to: {csv_path}")
 
-    # Episode 1 (second episode): frames 64-98
-    ep1_indices = range(64, 99)
-    # Episode 2 (third episode): frames 99-131
-    ep2_indices = range(99, 132)
+    # Derive episode frame ranges dynamically from GT/logged labels (handles off-by-one)
+    ep_ranges = _episode_frame_ranges(gt_data, labels_dir)
 
     # Test with all interpolation modes
     interpolation_modes = ["none", "linear", "cubic"]
@@ -627,7 +689,10 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
         
         all_errors = all_errors_by_mode[interp_mode]
         
-        for episode_idx, frame_indices in [(1, ep1_indices), (2, ep2_indices)]:
+        for episode_idx in (1, 2):
+            if episode_idx not in ep_ranges:
+                continue
+            frame_indices = ep_ranges[episode_idx]
             print(f"\nProcessing Episode {episode_idx} (frames {frame_indices.start}-{frame_indices.stop-1})...")
             
             # Compute GT homography from the first frame
@@ -646,6 +711,11 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
             # Compute per-frame mAP using raw masks (before warping)
             map_by_frame = _map_50_95_for_episode(episode.raw_masks_by_index)
 
+            # Only use frames with ball detections for calibration/metrics to avoid NaNs
+            results_with_ball = _frames_with_ball(episode.results_by_index)
+            if len(results_with_ball) < 2:
+                raise AssertionError("Not enough frames with ball detections for metrics")
+
             bev_metrics = episode.lane_metrics
             assert len(bev_metrics.fractions) == 4
             assert len(bev_metrics.velocity_at_frac) == 4
@@ -657,7 +727,7 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
             # Calibrate BEV coordinates to world coordinates using per-frame GT
             # _calibrate_bev_to_world already drops frames with bev_centroid is None
             a_s, b_s, a_l, b_l = _calibrate_bev_to_world(
-                episode.results_by_index, gt_data, episode_idx
+                results_with_ball, gt_data, episode_idx
             )
 
             # Build world-space LaneMetrics from BEV metrics
@@ -669,7 +739,7 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
             seg_map_per_fraction: List[float] = []
 
             # Extract BEV trajectory to find closest frames for fractions
-            s_bev, l_bev, frames_with_ball = _extract_bev_axes(episode.results_by_index)
+            s_bev, l_bev, frames_with_ball = _extract_bev_axes(results_with_ball)
             
             for i, frac in enumerate(world_fractions):
                 s_bev_target = bev_metrics.frac_positions[i]
@@ -709,7 +779,7 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
             gt_metrics = _compute_lane_metrics_ground_truth(episode_idx, gt_data)
 
             # Compute episode mean mAP
-            episode_mean_seg_map = float(np.mean(list(map_by_frame.values()))) if map_by_frame else None
+            episode_mean_seg_map = float(np.nanmean(list(map_by_frame.values()))) if map_by_frame else None
 
             # Log detailed results
             _log_processor_test_results(
@@ -799,10 +869,177 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
 
     print(f"\n{'='*60}")
     print(f"Episodes tested: 2 (episodes 1 & 2)")
-    print(f"Total frames: {len(ep1_indices) + len(ep2_indices)}")
+    total_frames = sum(len(ep_ranges[ep]) for ep in (1, 2) if ep in ep_ranges)
+    print(f"Total frames: {total_frames}")
     print(f"Results saved to: {csv_path}")
     print(f"{'='*60}")
 
     csv_file.close()  # Close the CSV file
-
-
+    
+    # ===================================================================
+    # VISUALIZATION: Generate trajectory plots and error analysis graphs
+    # ===================================================================
+    print(f"\n{'='*60}")
+    print("GENERATING VISUALIZATION ARTIFACTS")
+    print(f"{'='*60}")
+    
+    # Import visualization module
+    from processing.postprocessing.visualizer import TrajectoryVisualizer, ErrorAnalysisPlotter
+    
+    # Create output directory for visualizations
+    viz_output_dir = _project_root() / "processing" / "visualization_output"
+    viz_output_dir.mkdir(exist_ok=True)
+    
+    # Re-run processors to collect trajectory data for visualization
+    # (We need to store trajectories and lane boundaries from each mode)
+    trajectories_by_mode = {}
+    lane_boundary = None
+    errors_by_mode = {}
+    
+    for interp_mode in interpolation_modes:
+        print(f"\nCollecting trajectory data for {interp_mode} mode...")
+        
+        pre = YOLOSegPreprocessor(config=infer_cfg)
+        post = PostProcessor(out_size=(400, 800), dt=1.0 / 30.0, buffer_len=128, interpolation_mode=interp_mode)
+        proc = Processor(preprocessor=pre, postprocessor=post)
+        
+        # Use episode 1 for visualization (it's representative)
+        episode_idx = 1
+        frame_indices = ep_ranges[episode_idx]
+        
+        first_frame_stem = f"_{frame_indices.start:04d}"
+        src_pts, dst_pts = _homography_from_gt_lane(first_frame_stem, post.out_size)
+        
+        episode = proc.run_episode_from_indices(
+            images_dir, frame_indices, homography_src_dst=(src_pts, dst_pts)
+        )
+        
+        # Extract trajectory
+        viz = TrajectoryVisualizer(bev_size=post.out_size)
+        trajectory = viz.extract_trajectory_from_results(episode.results_by_index)
+        trajectories_by_mode[interp_mode] = trajectory
+        
+        # Extract lane boundary (only once, it's the same for all modes)
+        if lane_boundary is None and episode.results_by_index:
+            first_result = episode.results_by_index[frame_indices.start]
+            lane_boundary = viz.extract_lane_boundary(first_result.warped_lane)
+        
+        # Extract representative errors for overlay
+        results_with_ball = _frames_with_ball(episode.results_by_index)
+        a_s, b_s, a_l, b_l = _calibrate_bev_to_world(
+            results_with_ball, gt_data, episode_idx
+        )
+        
+        bev_metrics = episode.lane_metrics
+        world_vel_at_frac: List[Tuple[float, float, float]] = []
+        world_acc_at_frac: List[Tuple[float, float, float]] = []
+        
+        for i, frac in enumerate(bev_metrics.fractions):
+            vx_bev, vy_bev, _ = bev_metrics.velocity_at_frac[i]
+            ax_bev, ay_bev, _ = bev_metrics.acceleration_at_frac[i]
+            
+            vx_world = a_s * vx_bev
+            vy_world = a_l * vy_bev
+            speed_world = float(np.hypot(vx_world, vy_world))
+            
+            ax_world = a_s * ax_bev
+            ay_world = a_l * ay_bev
+            accel_world = float(np.hypot(ax_world, ay_world))
+            
+            world_vel_at_frac.append((vx_world, vy_world, speed_world))
+            world_acc_at_frac.append((ax_world, ay_world, accel_world))
+        
+        pred_world_metrics = LaneMetrics(
+            fractions=tuple(bev_metrics.fractions),
+            frac_positions=tuple([a_s * p + b_s for p in bev_metrics.frac_positions]),
+            velocity_at_frac=tuple(world_vel_at_frac),
+            acceleration_at_frac=tuple(world_acc_at_frac),
+            total_break=a_l * bev_metrics.total_break,
+            end_lane_speed=world_vel_at_frac[-1][2],
+        )
+        
+        gt_metrics = _compute_lane_metrics_ground_truth(episode_idx, gt_data)
+        
+        # Compute average errors across all fractions for display
+        map_by_frame = _map_50_95_for_episode(episode.raw_masks_by_index)
+        episode_mean_seg_map = float(np.nanmean(list(map_by_frame.values()))) if map_by_frame else 0.0
+        
+        avg_errors = {
+            'vel_x_error': np.mean([pred_world_metrics.velocity_at_frac[i][0] - gt_metrics.velocity_at_frac[i][0] 
+                                   for i in range(len(gt_metrics.fractions))]),
+            'vel_y_error': np.mean([pred_world_metrics.velocity_at_frac[i][1] - gt_metrics.velocity_at_frac[i][1] 
+                                   for i in range(len(gt_metrics.fractions))]),
+            'speed_error': np.mean([pred_world_metrics.velocity_at_frac[i][2] - gt_metrics.velocity_at_frac[i][2] 
+                                   for i in range(len(gt_metrics.fractions))]),
+            'acc_x_error': np.mean([pred_world_metrics.acceleration_at_frac[i][0] - gt_metrics.acceleration_at_frac[i][0] 
+                                   for i in range(len(gt_metrics.fractions))]),
+            'acc_y_error': np.mean([pred_world_metrics.acceleration_at_frac[i][1] - gt_metrics.acceleration_at_frac[i][1] 
+                                   for i in range(len(gt_metrics.fractions))]),
+            'accel_mag_error': np.mean([pred_world_metrics.acceleration_at_frac[i][2] - gt_metrics.acceleration_at_frac[i][2] 
+                                       for i in range(len(gt_metrics.fractions))]),
+            'total_break_error': pred_world_metrics.total_break - gt_metrics.total_break,
+            'end_speed_error': pred_world_metrics.end_lane_speed - gt_metrics.end_lane_speed,
+            'seg_map_50_95': episode_mean_seg_map,
+        }
+        
+        errors_by_mode[interp_mode] = avg_errors
+    
+    # Generate individual trajectory plots
+    print("\nGenerating individual trajectory plots...")
+    for mode in interpolation_modes:
+        output_path = viz_output_dir / f"trajectory_{mode}.png"
+        viz.plot_single_trajectory(
+            trajectory=trajectories_by_mode[mode],
+            lane_boundary=lane_boundary,
+            interpolation_mode=mode,
+            errors=errors_by_mode[mode],
+            output_path=output_path,
+        )
+        plt.close()  # Close to free memory
+    
+    # Generate comparison plot
+    print("Generating comparison plot...")
+    comparison_path = viz_output_dir / "trajectory_comparison.png"
+    viz.plot_comparison(
+        trajectories=trajectories_by_mode,
+        lane_boundary=lane_boundary,
+        errors=errors_by_mode,
+        output_path=comparison_path,
+    )
+    plt.close()
+    
+    # Generate error analysis plots from CSV
+    print("Generating error analysis plots...")
+    
+    # Parse CSV data
+    csv_data = []
+    with open(csv_path, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            csv_data.append(row)
+    
+    error_plot = ErrorAnalysisPlotter()
+    
+    # Detailed error analysis
+    error_analysis_path = viz_output_dir / "error_analysis.png"
+    error_plot.plot_error_comparison(csv_data, output_path=error_analysis_path)
+    plt.close()
+    
+    # Summary metrics
+    summary_metrics_path = viz_output_dir / "summary_metrics.png"
+    error_plot.plot_summary_metrics(csv_data, output_path=summary_metrics_path)
+    plt.close()
+    
+    print(f"\n{'='*60}")
+    print("VISUALIZATION COMPLETE")
+    print(f"{'='*60}")
+    print(f"Output directory: {viz_output_dir}")
+    print("\nGenerated files:")
+    print(f"  1. trajectory_none.png      - Raw trajectory (no interpolation)")
+    print(f"  2. trajectory_linear.png    - Piecewise linear interpolation")
+    print(f"  3. trajectory_cubic.png     - Cubic spline interpolation")
+    print(f"  4. trajectory_comparison.png - Side-by-side comparison")
+    print(f"  5. error_analysis.png       - Detailed error analysis plots")
+    print(f"  6. summary_metrics.png      - Summary performance metrics")
+    print(f"\nThese files are ready for your presentation!")
+    print(f"{'='*60}\n")

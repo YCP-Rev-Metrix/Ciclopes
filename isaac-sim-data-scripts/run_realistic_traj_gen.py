@@ -36,7 +36,7 @@ MAX_STEPS_PER_EPISODE = 120  # hard safety cap
 # Output directory
 OUT_DIR = os.path.join(
     os.getcwd(),
-    r"isaacsim\synth_data_scripts\isaac_raw_output_curved_traj_v1",
+    r"isaacsim\synth_data_scripts\isaac_raw_output_curved_traj4_v1",
 )
 
 # Scene prim paths (must exist in your stage)
@@ -220,6 +220,10 @@ def generate_episode_frames(params: Dict[str, float]) -> List[Dict[str, float]]:
     prev_vx = None
     prev_vy = None
 
+    on_lane_margin_y = (LANE_WIDTH / 2.0) - BALL_RADIUS - 1e-3
+    min_x_allowed = LANE_X_END + BALL_RADIUS + 1e-3  # do not let center leave lane end
+    max_x_allowed = LANE_X_START - BALL_RADIUS - 1e-3
+
     for _ in range(MAX_STEPS_PER_EPISODE):
         # Fraction along lane
         lane_frac = max(0.0, min(1.0, lane_s / LANE_LENGTH))
@@ -227,9 +231,11 @@ def generate_episode_frames(params: Dict[str, float]) -> List[Dict[str, float]]:
         x = x_start - lane_s
         y = y0 + hook_ampl * _hook_profile(lane_frac)
 
-        # Basic on/off-lane condition (center exceeds lane bounds)
-        if abs(y - LANE_Y_CENTER) > (LANE_WIDTH / 2.0):
-            # Stop once the ball center has left the lane bounds
+        # Stop as soon as the ball would touch/leave the lane edge (respect radius)
+        if abs(y - LANE_Y_CENTER) > on_lane_margin_y:
+            break
+        # Stop if center walks past either lane end (respect radius)
+        if x < min_x_allowed or x > max_x_allowed:
             break
 
         # Approximate velocities using finite differences (position-based)
@@ -386,4 +392,3 @@ async def run_generation():
 import asyncio
 
 asyncio.ensure_future(run_generation())
-

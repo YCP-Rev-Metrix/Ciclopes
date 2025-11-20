@@ -1,0 +1,9 @@
+numpy
+opencv-python
+Pillow
+tqdm
+
+# Provided by Isaac Sim environment (do not pip install here):
+#   omni.replicator.core
+#   omni.usd
+#   omni.kit.app

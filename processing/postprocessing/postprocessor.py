@@ -108,6 +108,10 @@ class BufferCalcs:
         if pos is None:
             return  # drop missing detections; you could also repeat-last if you prefer
 
+        # Validate position is finite
+        if not (np.isfinite(pos[0]) and np.isfinite(pos[1])):
+            raise ValueError(f"Non-finite position detected: {pos}")
+
         self.positions.append(pos)
         if len(self.positions) > self.buffer_len:
             self.positions.pop(0)
@@ -276,19 +280,34 @@ class PostProcessor:
         t_interp = np.linspace(t[0], t[-1], len(t) * 3)
         
         if self.interpolation_mode == "linear":
-            # Piecewise linear interpolation
-            interp_func = interpolate.interp1d(t, data, kind='linear', axis=0, fill_value='extrapolate')
+            # Piecewise linear interpolation - NO extrapolation
+            interp_func = interpolate.interp1d(
+                t, data, kind='linear', axis=0,
+                bounds_error=False, fill_value=(data[0], data[-1])  # Clamp to endpoints
+            )
             data_interp = interp_func(t_interp)
         elif self.interpolation_mode == "cubic":
             # Cubic spline interpolation
             if len(t) < 4:
                 # Fall back to linear if not enough points for cubic
-                interp_func = interpolate.interp1d(t, data, kind='linear', axis=0, fill_value='extrapolate')
+                interp_func = interpolate.interp1d(
+                    t, data, kind='linear', axis=0,
+                    bounds_error=False, fill_value=(data[0], data[-1])
+                )
                 data_interp = interp_func(t_interp)
             else:
-                # Use cubic spline
-                interp_func = interpolate.CubicSpline(t, data, axis=0, bc_type='natural')
+                # Use cubic spline with natural boundary conditions (no extrapolation)
+                interp_func = interpolate.CubicSpline(
+                    t, data, axis=0, bc_type='natural', extrapolate=False
+                )
                 data_interp = interp_func(t_interp)
+                # CubicSpline with extrapolate=False returns NaN outside bounds,
+                # so clip to valid range
+                data_interp = np.where(
+                    np.isnan(data_interp),
+                    np.where(t_interp[:, None] < t[0], data[0], data[-1]),
+                    data_interp
+                )
         else:
             return t, data
             
@@ -323,7 +342,8 @@ class PostProcessor:
             c = results_by_index[i].bev_centroid
             if c is not None:
                 traj.append(c)
-                frame_times.append(float(i))
+                # Convert frame index to seconds using dt to avoid mixing units
+                frame_times.append(float(i) * self.dt)
 
         if len(traj) < 2:
             raise ValueError("Not enough valid centroids to compute metrics")
@@ -333,6 +353,17 @@ class PostProcessor:
         
         # Apply interpolation if enabled
         t, bev_interp = self._apply_interpolation(t_raw, bev)
+
+        # FAIL FAST: Check for any invalid values BEFORE they propagate
+        if not np.all(np.isfinite(bev_interp)):
+            raise ValueError(
+                f"Non-finite values detected after interpolation. "
+                f"NaN count: {np.sum(np.isnan(bev_interp))}, "
+                f"Inf count: {np.sum(np.isinf(bev_interp))}"
+            )
+        
+        if not np.all(np.isfinite(t)):
+            raise ValueError("Non-finite time values detected")
         
         xs = bev_interp[:, 0]
         ys = bev_interp[:, 1]
@@ -353,13 +384,31 @@ class PostProcessor:
         if lane_len <= 0.0:
             raise ValueError("Non-positive lane length in BEV coordinates")
 
-        # Finite-difference velocities and accelerations in BEV space.
-        # Use actual time steps for gradient computation
-        dt_array = np.gradient(t) * self.dt
-        vs = np.gradient(s, dt_array)
-        vl = np.gradient(l, dt_array)
-        ax = np.gradient(vs, dt_array)
-        ay = np.gradient(vl, dt_array)
+        # Compute uniform dt after interpolation
+        # After interpolation, t should be uniformly spaced
+        dt_uniform = float(np.mean(np.diff(t)))
+        
+        # Finite-difference velocities and accelerations in BEV space
+        # Use uniform dt for cleaner gradients
+        vs = np.gradient(s, dt_uniform)
+        vl = np.gradient(l, dt_uniform)
+        ax = np.gradient(vs, dt_uniform)
+        ay = np.gradient(vl, dt_uniform)
+        
+        # FAIL FAST: Check derivatives for validity
+        if not np.all(np.isfinite(vs)) or not np.all(np.isfinite(vl)):
+            raise ValueError(
+                f"Non-finite velocity values. "
+                f"vs: NaN={np.sum(np.isnan(vs))}, Inf={np.sum(np.isinf(vs))}; "
+                f"vl: NaN={np.sum(np.isnan(vl))}, Inf={np.sum(np.isinf(vl))}"
+            )
+        
+        if not np.all(np.isfinite(ax)) or not np.all(np.isfinite(ay)):
+            raise ValueError(
+                f"Non-finite acceleration values. "
+                f"ax: NaN={np.sum(np.isnan(ax))}, Inf={np.sum(np.isinf(ax))}; "
+                f"ay: NaN={np.sum(np.isnan(ay))}, Inf={np.sum(np.isinf(ay))}"
+            )
 
         frac_list = []
         frac_positions = []
@@ -397,4 +446,3 @@ class PostProcessor:
             total_break=total_break,
             end_lane_speed=end_speed,
         )
-

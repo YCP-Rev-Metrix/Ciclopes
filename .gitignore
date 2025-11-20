@@ -24,3 +24,4 @@ OPTIMIZATION_SUMMARY.md
 /data/test
 /data
 *.pyc
+/processing/visualization_output
