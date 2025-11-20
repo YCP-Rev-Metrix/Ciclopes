@@ -1,6 +1,6 @@
 /synth_data/envs/__pycache__
 /synth_data/utils/__pycache__
-/data
+
 /src/core/__pycache__
 /src/components/optimizers/__pycache__
 /src/trainers/__pycache__
@@ -21,3 +21,6 @@ DEPENDENCY_RESOLUTION.md
 OPTIMIZATION_SUMMARY.md
 
 /postprocessing/__pycache__
+/data/test
+/data
+*.pyc

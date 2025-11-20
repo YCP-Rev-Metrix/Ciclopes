@@ -2,7 +2,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Literal
+from scipy import interpolate
 
 
 # ---------- Geometry / Warping ----------
@@ -179,10 +180,12 @@ class PostProcessor:
     def __init__(self,
                  out_size: Tuple[int, int] = (400, 800),
                  dt: float = 1.0 / 30.0,
-                 buffer_len: int = 12):
+                 buffer_len: int = 12,
+                 interpolation_mode: Literal["none", "linear", "cubic"] = "none"):
         self.out_size = (int(out_size[0]), int(out_size[1]))
         self.dt = float(dt)
         self.buffer = BufferCalcs(buffer_len=buffer_len, dt=self.dt)
+        self.interpolation_mode = interpolation_mode
 
     def _compute_H_once(
         self,
@@ -246,6 +249,51 @@ class PostProcessor:
     # ------------------------------------------------------------------
     # Higher-level lane metrics for test evaluation
     # ------------------------------------------------------------------
+    def _apply_interpolation(
+        self,
+        t: np.ndarray,
+        data: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Apply interpolation to trajectory data based on interpolation_mode.
+        
+        Parameters
+        ----------
+        t : np.ndarray
+            Time values (or frame indices)
+        data : np.ndarray
+            Data to interpolate (positions, velocities, etc.)
+            
+        Returns
+        -------
+        t_interp, data_interp : Tuple[np.ndarray, np.ndarray]
+            Interpolated time and data values
+        """
+        if self.interpolation_mode == "none" or len(t) < 3:
+            return t, data
+        
+        # Create denser time grid for interpolation
+        t_interp = np.linspace(t[0], t[-1], len(t) * 3)
+        
+        if self.interpolation_mode == "linear":
+            # Piecewise linear interpolation
+            interp_func = interpolate.interp1d(t, data, kind='linear', axis=0, fill_value='extrapolate')
+            data_interp = interp_func(t_interp)
+        elif self.interpolation_mode == "cubic":
+            # Cubic spline interpolation
+            if len(t) < 4:
+                # Fall back to linear if not enough points for cubic
+                interp_func = interpolate.interp1d(t, data, kind='linear', axis=0, fill_value='extrapolate')
+                data_interp = interp_func(t_interp)
+            else:
+                # Use cubic spline
+                interp_func = interpolate.CubicSpline(t, data, axis=0, bc_type='natural')
+                data_interp = interp_func(t_interp)
+        else:
+            return t, data
+            
+        return t_interp, data_interp
+
     def compute_lane_metrics(
         self,
         results_by_index: Dict[int, ProcessResult],
@@ -258,6 +306,11 @@ class PostProcessor:
         We treat the dominant BEV axis of motion (x or y) as the lane axis and
         the other axis as lateral. This is consistent with how tests currently
         recover a 1D coordinate along the lane from BEV centroids.
+        
+        Interpolation can be applied based on self.interpolation_mode:
+        - "none": Use raw trajectory with np.gradient
+        - "linear": Piecewise linear interpolation
+        - "cubic": Cubic spline interpolation
         """
         if not results_by_index:
             raise ValueError("results_by_index is empty")
@@ -265,17 +318,24 @@ class PostProcessor:
         # Collect BEV centroids in temporal order, skipping missing ones.
         idxs = sorted(results_by_index.keys())
         traj: List[Tuple[float, float]] = []
+        frame_times: List[float] = []
         for i in idxs:
             c = results_by_index[i].bev_centroid
             if c is not None:
                 traj.append(c)
+                frame_times.append(float(i))
 
         if len(traj) < 2:
             raise ValueError("Not enough valid centroids to compute metrics")
 
         bev = np.array(traj, dtype=np.float64)
-        xs = bev[:, 0]
-        ys = bev[:, 1]
+        t_raw = np.array(frame_times, dtype=np.float64)
+        
+        # Apply interpolation if enabled
+        t, bev_interp = self._apply_interpolation(t_raw, bev)
+        
+        xs = bev_interp[:, 0]
+        ys = bev_interp[:, 1]
 
         # Choose primary axis as the one with larger dynamic range.
         range_x = float(xs.max() - xs.min())
@@ -294,11 +354,12 @@ class PostProcessor:
             raise ValueError("Non-positive lane length in BEV coordinates")
 
         # Finite-difference velocities and accelerations in BEV space.
-        dt = self.dt
-        vs = np.gradient(s, dt)
-        vl = np.gradient(l, dt)
-        ax = np.gradient(vs, dt)
-        ay = np.gradient(vl, dt)
+        # Use actual time steps for gradient computation
+        dt_array = np.gradient(t) * self.dt
+        vs = np.gradient(s, dt_array)
+        vl = np.gradient(l, dt_array)
+        ax = np.gradient(vs, dt_array)
+        ay = np.gradient(vl, dt_array)
 
         frac_list = []
         frac_positions = []

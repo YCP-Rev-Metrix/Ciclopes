@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
+from typing import List, Dict
 
 import cv2
 import numpy as np
 
 from processing.preprocessing.preprocessor import YOLOSegPreprocessor, InferenceConfig
+
+
+def _project_root() -> Path:
+    # preprocessing/ -> processing/ -> project root
+    return Path(__file__).resolve().parents[2]
+
+
+def _test_data_dir() -> Path:
+    return _project_root() / "data" / "test" / "curved_test_data_v1"
 
 
 class _DummyMasks:
@@ -92,4 +101,122 @@ def test_yoloseg_preprocessor_runs_predict_and_builds_masks(tmp_path):
         assert lane.max() in (0, 255)
         assert ball.max() in (0, 255)
 
+
+def _parse_yolo_seg_file(label_path: Path) -> Dict[int, np.ndarray]:
+    class_to_poly: Dict[int, np.ndarray] = {}
+    with open(label_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            cls_id = int(float(parts[0]))
+            coords = list(map(float, parts[1:]))
+            assert len(coords) % 2 == 0 and len(coords) >= 8, (
+                f"Expected polygon pairs for segmentation in {label_path}"
+            )
+            pts = np.array(coords, dtype=np.float32).reshape(-1, 2)
+            class_to_poly[cls_id] = pts
+    return class_to_poly
+
+
+def _polygon_norm_to_mask(pts_norm: np.ndarray, width: int, height: int) -> np.ndarray:
+    mask = np.zeros((height, width), dtype=np.uint8)
+    pts_px = np.column_stack(
+        [pts_norm[:, 0] * (width - 1), pts_norm[:, 1] * (height - 1)]
+    )
+    pts_px = np.round(pts_px).astype(np.int32)
+    cv2.fillPoly(mask, [pts_px], 255)
+    return mask
+
+
+class _DatasetBackedYOLO:
+    """
+    Minimal YOLO-like model whose `.predict()` loads masks from the
+    curved_test_data_v1 YOLO segmentation labels instead of running a network.
+    """
+
+    def __init__(self) -> None:
+        self.names = {0: "lane", 1: "ball"}
+        self.data_dir = _test_data_dir()
+
+    def predict(self, source: str, imgsz: int, device: str, verbose: bool):
+        images_dir = self.data_dir / "images"
+        labels_dir = self.data_dir / "labels"
+
+        img_path = Path(source)
+        stem = img_path.stem  # e.g. "_0064"
+
+        # Load image to get size
+        img = cv2.imread(str(images_dir / f"{stem}.jpg"), cv2.IMREAD_COLOR)
+        assert img is not None, f"Failed to read image at {img_path}"
+        h, w = img.shape[:2]
+
+        # Load YOLO segmentation polygons and convert to masks
+        label_path = labels_dir / f"{stem}.txt"
+        class_to_poly = _parse_yolo_seg_file(label_path)
+
+        # Per data.yaml: 0 = lane, 1 = ball
+        lane_poly = class_to_poly[0]
+        ball_poly = class_to_poly[1]
+
+        lane_mask = _polygon_norm_to_mask(lane_poly, w, h).astype(np.float32) / 255.0
+        ball_mask = _polygon_norm_to_mask(ball_poly, w, h).astype(np.float32) / 255.0
+
+        mask_stack = np.stack([lane_mask, ball_mask], axis=0)  # [2, h, w]
+
+        class _Masks:
+            def __init__(self, data):
+                self.data = data
+
+        class _Boxes:
+            def __init__(self, cls_ids):
+                self.cls = cls_ids
+
+        class _Result:
+            def __init__(self, masks, boxes, orig_shape):
+                self.masks = masks
+                self.boxes = boxes
+                self.orig_shape = orig_shape
+
+        masks = _Masks(mask_stack)
+        boxes = _Boxes(np.array([0.0, 1.0], dtype=np.float32))
+        return [_Result(masks, boxes, (h, w))]
+
+
+def test_yoloseg_preprocessor_on_curved_dataset_episodes_1_and_2():
+    """
+    End-to-end preprocessor test on the real curved_test_data_v1 images/labels
+    for episodes 1 and 2 (second and third episodes).
+    """
+    data_dir = _test_data_dir()
+    images_dir = data_dir / "images"
+
+    dummy_model = _DatasetBackedYOLO()
+    cfg = InferenceConfig(
+        weights_path=_project_root() / "best.pt",  # not actually used by dummy model
+        imgsz=2048,
+        device="cpu",
+    )
+    pre = YOLOSegPreprocessor(config=cfg, model=dummy_model)
+
+    # Episode 1 (second episode): frames 64-98
+    ep1_indices = range(64, 99)
+    # Episode 2 (third episode): frames 99-131 (frame 132 has no label/image)
+    ep2_indices = range(99, 132)
+
+    for frame_indices in (ep1_indices, ep2_indices):
+        masks_by_index, (width, height) = pre.run_on_indices(images_dir, frame_indices)
+
+        # All requested frames should be present
+        assert set(masks_by_index.keys()) == set(frame_indices)
+
+        # Masks should be non-empty and correctly shaped
+        for idx in frame_indices:
+            lane = masks_by_index[idx]["lane"]
+            ball = masks_by_index[idx]["ball"]
+            assert lane.shape == (height, width)
+            assert ball.shape == (height, width)
+            assert lane.max() in (0, 255)
+            assert ball.max() in (0, 255)
 

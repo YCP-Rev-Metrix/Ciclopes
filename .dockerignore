@@ -1,0 +1,17 @@
+# Data and outputs
+data/
+outputs/
+*.pt
+*.pth
+
+# Cache files
+__pycache__/
+*.pyc
+.pytest_cache/
+*.cache
+
+# Other large/unnecessary files
+.vscode/
+.cursor/
+*.log
+*.tmp

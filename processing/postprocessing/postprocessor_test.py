@@ -13,12 +13,18 @@ from processing.postprocessing.postprocessor import PostProcessor, ProcessResult
 
 
 def _project_root() -> Path:
-    # postprocessing/ -> project root
-    return Path(__file__).resolve().parents[1]
+    # postprocessing/ -> processing/ -> project root
+    return Path(__file__).resolve().parents[2]
 
 
 def _test_data_dir() -> Path:
-    return _project_root() / "data" / "test" / "test_data_v1"
+    """
+    Location of the YOLO-style test dataset used to synthesize masks for the
+    postprocessor tests.
+
+    This now points at the curved-trajectory test set generated from Isaac Sim.
+    """
+    return _project_root() / "data" / "test" / "curved_test_data_v1"
 
 
 def _report_path() -> Path:
@@ -102,6 +108,17 @@ def _build_masks_for_range(start_idx: int, end_idx: int) -> Tuple[Dict[int, Dict
 
 
 def _read_csv_episode(csv_path: Path, episode_idx: int) -> Dict[int, Dict[str, float]]:
+    """
+    Read per-frame ground truths for a given episode from the curved
+    trajectory CSV produced by `run_realistic_traj_gen.py`.
+
+    The CSV schema is:
+      global_frame_idx,episode_idx,frame_in_episode,t_sec,x,y,
+      vx_units_per_sec,vy_units_per_sec,speed_units_per_sec,
+      ax_units_per_sec2,ay_units_per_sec2,accel_units_per_sec2,
+      lane_s,lane_frac,lat_from_center,lat_from_start,
+      episode_total_break,episode_end_speed
+    """
     out: Dict[int, Dict[str, float]] = {}
 
     with open(csv_path, "r", newline="", encoding="utf-8") as f:
@@ -110,13 +127,16 @@ def _read_csv_episode(csv_path: Path, episode_idx: int) -> Dict[int, Dict[str, f
             if int(row["episode_idx"]) != episode_idx:
                 continue
 
-            fi = int(row["frame_idx"])
+            fi = int(row["global_frame_idx"])
             out[fi] = {
                 "x": float(row["x"]),
                 "y": float(row["y"]),
                 "t": float(row["t_sec"]),
                 "vx": float(row["vx_units_per_sec"]),
-                "dx_per_frame": float(row["dx_units_per_frame"]),
+                "vy": float(row["vy_units_per_sec"]),
+                "speed": float(row["speed_units_per_sec"]),
+                "lane_s": float(row["lane_s"]),
+                "lane_frac": float(row["lane_frac"]),
             }
 
     return out
@@ -140,8 +160,10 @@ def _best_fit_axis(bev_x: np.ndarray, bev_y: np.ndarray, csv_x: np.ndarray):
 
 
 def test_postprocessor_bev_centroid_track_matches_csv_x():
-    start_idx, end_idx = 30, 59  # episode 1
-    csv_path = _project_root() / "data" / "test" / "constant_velocity_log.csv"
+    # Use the second curved-trajectory episode (episode_idx = 1).
+    # Frames 64-98 correspond to episode 1 in curved_trajectory_log.csv.
+    start_idx, end_idx = 64, 98
+    csv_path = _project_root() / "data" / "test" / "curved_trajectory_log.csv"
 
     masks_by_index, _ = _build_masks_for_range(start_idx, end_idx)
 
@@ -206,8 +228,10 @@ def test_postprocessor_bev_centroid_track_matches_csv_x():
 
 
 def test_postprocessor_velocity_consistent_with_csv_speed_magnitude():
-    start_idx, end_idx = 30, 59  # episode 1
-    csv_path = _project_root() / "data" / "test" / "constant_velocity_log.csv"
+    # Use the third curved-trajectory episode (episode_idx = 2).
+    # Frames 99-131 correspond to episode 2 in curved_trajectory_log.csv.
+    start_idx, end_idx = 99, 131
+    csv_path = _project_root() / "data" / "test" / "curved_trajectory_log.csv"
 
     masks_by_index, _ = _build_masks_for_range(start_idx, end_idx)
 
@@ -237,29 +261,58 @@ def test_postprocessor_velocity_consistent_with_csv_speed_magnitude():
     vel_x = np.array(vel_x, dtype=np.float64)  # length N-1 approximately
     vel_y = np.array(vel_y, dtype=np.float64)
 
-    csv_ep1 = _read_csv_episode(csv_path, episode_idx=1)
-    csv_x = np.array([csv_ep1[i]["x"] for i in range(start_idx, end_idx + 1)], dtype=np.float64)
+    csv_ep2 = _read_csv_episode(csv_path, episode_idx=2)
+    csv_x = np.array([csv_ep2[i]["x"] for i in range(start_idx, end_idx + 1)], dtype=np.float64)
 
+    # Fit BEV axis to world x just as in the centroid test, but we now
+    # compare *speeds* from the BEV-derived velocities to the ground-truth
+    # speed_units_per_sec column.
     axis, coeffs, mae, _ = _best_fit_axis(bev_x, bev_y, csv_x)
     a = float(coeffs[0])  # scale factor only (offset cancels in velocity)
 
-    vel_units = a * (vel_x if axis == "x" else vel_y)
-    target_speed = 17.0
-    median_speed = float(np.median(np.abs(vel_units)))
-    n_vel = int(vel_units.size)
+    # Scale the BEV velocity component along the calibrated axis to world units.
+    vel_units_1d = a * (vel_x if axis == "x" else vel_y)
+    # Use magnitude as the effective speed.
+    speed_bev = np.abs(vel_units_1d)
+
+    # Ground-truth speeds from the CSV (skip the first frame which has no velocity).
+    csv_speed = np.array(
+        [csv_ep2[i]["speed"] for i in range(start_idx + 1, end_idx + 1)],
+        dtype=np.float64,
+    )
+
+    # Align lengths: vel_x/vel_y are approximately one element shorter than the
+    # number of frames because they are finite differences.
+    n = min(speed_bev.size, csv_speed.size)
+    speed_bev = speed_bev[:n]
+    csv_speed = csv_speed[:n]
+
+    median_speed = float(np.median(np.abs(speed_bev)))
+    median_csv_speed = float(np.median(np.abs(csv_speed)))
+    n_vel = int(speed_bev.size)
 
     logger = logging.getLogger(__name__)
     logger.info(
-        "Episode 1 frames %d-%d: velocity using BEV %s-axis; median=%.3f units/s (target=%.1f); samples=%d",
-        start_idx, end_idx, axis, median_speed, target_speed, n_vel
+        "Curved episode 0 frames %d-%d: velocity using BEV %s-axis; "
+        "median_bev=%.3f units/s, median_csv=%.3f units/s; samples=%d",
+        start_idx,
+        end_idx,
+        axis,
+        median_speed,
+        median_csv_speed,
+        n_vel,
     )
     _append_report([
         f"[{datetime.utcnow().isoformat()}Z] test_postprocessor_velocity_consistent_with_csv_speed_magnitude",
-        f"  frames={start_idx}-{end_idx}, axis={axis}, median_speed={median_speed:.3f}, target={target_speed:.1f}, samples={n_vel}",
+        f"  frames={start_idx}-{end_idx}, axis={axis}, "
+        f"median_bev={median_speed:.3f}, median_csv={median_csv_speed:.3f}, samples={n_vel}",
         ""
     ])
 
-    assert abs(median_speed - target_speed) < 1.0, (
-        f"Velocity magnitude off using BEV {axis}-axis: {median_speed:.3f} vs {target_speed:.3f}"
+    # Sanity check: the median BEV-derived speed should be within a small
+    # tolerance of the ground-truth median speed.
+    assert abs(median_speed - median_csv_speed) < 1.0, (
+        f"Velocity magnitude off using BEV {axis}-axis: "
+        f"{median_speed:.3f} vs CSV median {median_csv_speed:.3f}"
     )
 

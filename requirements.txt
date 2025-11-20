@@ -22,6 +22,9 @@ scipy>=1.11
 pyyaml>=6.0
 matplotlib>=3.8
 
+pytest>=7.4.0,<8.0.0
+pytest-cov>=4.0.0 
+
 # === YOLO ===
 ultralytics>=8.3.0           # YOLOv11 segmentation support
 

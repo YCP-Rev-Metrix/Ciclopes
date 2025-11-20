@@ -51,11 +51,11 @@ class YOLOSegPreprocessor:
         self.project_root = Path(__file__).resolve().parents[2]
 
         if config is None:
-            default_weights = self.project_root / "yolo11s-seg.pt"
+            default_weights = self.project_root / "best.pt"
             config = InferenceConfig(weights_path=default_weights)
 
         if config.weights_path is None:
-            config.weights_path = self.project_root / "yolo11s-seg.pt"
+            config.weights_path = self.project_root / "best.pt"
 
         self.config = config
 
