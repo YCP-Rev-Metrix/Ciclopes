@@ -12,10 +12,70 @@ class Warp:
     pass
 
     @staticmethod
-    def compute_homography(src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray:
-        H, status = cv2.findHomography(src_pts, dst_pts, method=cv2.RANSAC)
+    def compute_homography(
+        src_pts: np.ndarray, 
+        dst_pts: np.ndarray,
+        min_inlier_ratio: float = 0.5,
+        max_condition_number: float = 1e6,
+    ) -> np.ndarray:
+        """
+        Compute homography with RANSAC and validate the result.
+        
+        ISSUE #9 FIX: Added validation for:
+        - Inlier ratio to ensure enough correspondences are good
+        - Condition number to detect near-singular/degenerate matrices
+        - Determinant sign to detect reflections
+        
+        Parameters
+        ----------
+        src_pts : np.ndarray
+            Source points (N, 2)
+        dst_pts : np.ndarray
+            Destination points (N, 2)
+        min_inlier_ratio : float
+            Minimum ratio of inliers required (0.0 to 1.0)
+        max_condition_number : float
+            Maximum condition number before matrix is considered degenerate
+            
+        Returns
+        -------
+        np.ndarray
+            3x3 homography matrix
+        """
+        H, status = cv2.findHomography(src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0)
         if H is None:
             raise RuntimeError("cv2.findHomography failed. Check your correspondences.")
+        
+        # Check inlier ratio
+        if status is not None:
+            inlier_ratio = float(np.sum(status)) / len(status)
+            if inlier_ratio < min_inlier_ratio:
+                raise RuntimeError(
+                    f"Homography inlier ratio {inlier_ratio:.2%} is below threshold "
+                    f"{min_inlier_ratio:.2%}. Check point correspondences."
+                )
+        
+        # Check for degenerate matrix (near-singular)
+        try:
+            cond = np.linalg.cond(H)
+            if cond > max_condition_number:
+                raise RuntimeError(
+                    f"Homography condition number {cond:.2e} exceeds threshold "
+                    f"{max_condition_number:.2e}. Matrix is near-singular."
+                )
+        except np.linalg.LinAlgError:
+            raise RuntimeError("Homography matrix is singular.")
+        
+        # Check determinant sign (negative indicates reflection which is usually wrong)
+        det = np.linalg.det(H)
+        if det < 0:
+            # This is a warning case - reflections can be valid but are unusual
+            import warnings
+            warnings.warn(
+                f"Homography has negative determinant ({det:.4f}), indicating a reflection. "
+                "This is unusual for camera-to-BEV transforms."
+            )
+        
         return H
 
     @staticmethod
@@ -95,7 +155,14 @@ class Warp:
 # ---------- Temporal buffer & kinematics ----------
 
 class BufferCalcs:
-    pass
+    """
+    Temporal buffer for tracking positions, velocities, and accelerations.
+    
+    ISSUE #10 FIX: Properly handles missing frames by tracking the number of
+    frames since last valid position and adjusting dt accordingly. Without this,
+    if frame N is missing, velocity at N+1 would span 2*dt but divide by 1*dt,
+    doubling the velocity estimate.
+    """
 
     def __init__(self, buffer_len: int = 12, dt: float = 1.0 / 30.0):
         self.buffer_len = int(buffer_len)
@@ -103,10 +170,14 @@ class BufferCalcs:
         self.positions: List[Tuple[float, float]] = []
         self.velocities: List[Tuple[float, float]] = []
         self.accelerations: List[Tuple[float, float]] = []
+        # Track frames since last valid position for proper dt calculation
+        self._frames_since_last_pos: int = 0
 
     def add(self, pos: Optional[Tuple[float, float]]) -> None:
         if pos is None:
-            return  # drop missing detections; you could also repeat-last if you prefer
+            # Track missing frames so we can adjust dt correctly
+            self._frames_since_last_pos += 1
+            return
 
         # Validate position is finite
         if not (np.isfinite(pos[0]) and np.isfinite(pos[1])):
@@ -116,12 +187,14 @@ class BufferCalcs:
         if len(self.positions) > self.buffer_len:
             self.positions.pop(0)
 
-        # velocity
+        # velocity - use adjusted dt based on frames since last position
         if len(self.positions) >= 2:
             x2, y2 = self.positions[-1]
             x1, y1 = self.positions[-2]
-            vx = (x2 - x1) / self.dt
-            vy = (y2 - y1) / self.dt
+            # ISSUE #10 FIX: Account for skipped frames in dt calculation
+            effective_dt = self.dt * (self._frames_since_last_pos + 1)
+            vx = (x2 - x1) / effective_dt
+            vy = (y2 - y1) / effective_dt
             self.velocities.append((vx, vy))
             if len(self.velocities) > self.buffer_len:
                 self.velocities.pop(0)
@@ -135,6 +208,9 @@ class BufferCalcs:
             self.accelerations.append((ax, ay))
             if len(self.accelerations) > self.buffer_len:
                 self.accelerations.pop(0)
+        
+        # Reset frame counter after successful position add
+        self._frames_since_last_pos = 0
 
     def latest_position(self) -> Optional[Tuple[float, float]]:
         return self.positions[-1] if self.positions else None
@@ -176,6 +252,9 @@ class LaneMetrics:
     acceleration_at_frac: Tuple[Tuple[float, float, float], ...]  # (ax, ay, |a|)
     total_break: float  # lateral |pos_end - pos_start|
     end_lane_speed: float
+    # BUG FIX #2: Track axis orientation for consistent sign handling
+    primary_axis: int = 0  # 0 = x-axis is primary (along-lane), 1 = y-axis
+    s_axis_flipped: bool = False  # True if s was negated to ensure increasing values
 
 
 class PostProcessor:
@@ -214,6 +293,11 @@ class PostProcessor:
         masks_by_index: Dict[int, Dict[str, np.ndarray]],
         homography_src_dst: Optional[Tuple[np.ndarray, np.ndarray]] = None
     ) -> Tuple[Dict[int, ProcessResult], np.ndarray]:
+        # BUG FIX #3: Reset buffer for each new episode to prevent cross-episode
+        # contamination. Without this, the first frames of episode N+1 would have
+        # velocities/accelerations computed from episode N's last positions.
+        self.buffer = BufferCalcs(buffer_len=self.buffer.buffer_len, dt=self.dt)
+        
         if not masks_by_index:
             return {}, np.eye(3, dtype=np.float64)
 
@@ -231,9 +315,11 @@ class PostProcessor:
             warped_lane = Warp.warp_mask(lane_mask, H, self.out_size)
             warped_ball = Warp.warp_mask(ball_mask, H, self.out_size)
 
-            # centroid in IMAGE -> map via H (faster than recomputing centroid in warped space)
-            img_centroid = Warp.centroid_from_mask(ball_mask)
-            bev_centroid = Warp.image_to_bev_point(img_centroid, H) if img_centroid else None
+            # ISSUE #8 FIX: Compute centroid directly from warped BEV mask.
+            # Homography transforms points, not area-weighted centroids. The centroid
+            # of a perspective-transformed shape != the transform of the original centroid.
+            # Computing centroid in BEV space is more accurate for metrics.
+            bev_centroid = Warp.centroid_from_mask(warped_ball)
 
             # update temporal buffer and fetch kinematics
             self.buffer.add(bev_centroid)
@@ -376,24 +462,28 @@ class PostProcessor:
         s = xs if primary_axis == 0 else ys  # along-lane coordinate
         l = ys if primary_axis == 0 else xs  # lateral coordinate
 
-        # Ensure s increases along the lane for simpler fraction logic.
+        # BUG FIX #2: Track if we flip the s-axis and apply sign correction
+        # This is needed so calibration can apply the correct sign to velocities
+        s_axis_flipped = False
         if s[-1] < s[0]:
             s = -s
+            s_axis_flipped = True
 
         lane_len = float(s[-1] - s[0])
         if lane_len <= 0.0:
             raise ValueError("Non-positive lane length in BEV coordinates")
 
-        # Compute uniform dt after interpolation
-        # After interpolation, t should be uniformly spaced
-        dt_uniform = float(np.mean(np.diff(t)))
+        # BUG FIX #1: Always use the original dt, NOT the interpolated dt
+        # The interpolated trajectory has more points but represents the SAME time span.
+        # Using np.mean(np.diff(t)) after interpolation gives dt/3, causing 3x velocity
+        # and ~9x acceleration errors.
+        dt_for_gradient = self.dt
         
         # Finite-difference velocities and accelerations in BEV space
-        # Use uniform dt for cleaner gradients
-        vs = np.gradient(s, dt_uniform)
-        vl = np.gradient(l, dt_uniform)
-        ax = np.gradient(vs, dt_uniform)
-        ay = np.gradient(vl, dt_uniform)
+        vs = np.gradient(s, dt_for_gradient)
+        vl = np.gradient(l, dt_for_gradient)
+        ax = np.gradient(vs, dt_for_gradient)
+        ay = np.gradient(vl, dt_for_gradient)
         
         # FAIL FAST: Check derivatives for validity
         if not np.all(np.isfinite(vs)) or not np.all(np.isfinite(vl)):
@@ -445,4 +535,6 @@ class PostProcessor:
             acceleration_at_frac=tuple(acc_at_frac),
             total_break=total_break,
             end_lane_speed=end_speed,
+            primary_axis=primary_axis,
+            s_axis_flipped=s_axis_flipped,
         )

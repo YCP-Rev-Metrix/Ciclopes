@@ -19,7 +19,13 @@ from .postprocessor import ProcessResult
 
 
 class TrajectoryVisualizer:
-    """Visualization tool for trajectory analysis in BEV space."""
+    """
+    Visualization tool for trajectory analysis in BEV space.
+    
+    BUG FIX #6: All plots use consistent Y-axis orientation (inverted to match
+    image coordinates with origin at top-left). This ensures lane boundaries
+    and trajectories align correctly across all visualization methods.
+    """
     
     # Color scheme for clean, professional plots
     COLORS = {
@@ -429,8 +435,10 @@ class TrajectoryVisualizer:
         ax.grid(True, alpha=0.25, color='#BDBDBD', linestyle='-', linewidth=0.8)
         ax.set_aspect('equal', adjustable='box')
 
-        # Note: Remove y-axis inversion to fix ball positioning
-        # The BEV coordinates are already in the correct orientation
+        # BUG FIX #6: Standardize Y-axis orientation across all plots
+        # Invert Y to match image coordinates (origin at top-left)
+        # This is consistent with plot_single_trajectory and plot_comparison
+        ax.invert_yaxis()
 
         plt.tight_layout()
 
@@ -577,27 +585,73 @@ class TrajectoryVisualizer:
     
     def extract_trajectory_from_results(
         self, 
-        results_by_index: Dict[int, ProcessResult]
+        results_by_index: Dict[int, ProcessResult],
+        apply_interpolation: bool = False,
+        interpolation_mode: str = "none",
+        dt: float = 1.0 / 30.0,
     ) -> List[Tuple[float, float]]:
         """
         Extract trajectory points from PostProcessor results.
+        
+        BUG FIX #5: Added option to apply interpolation so visualization matches
+        the data used for metrics computation.
         
         Parameters
         ----------
         results_by_index : Dict[int, ProcessResult]
             Results dictionary from PostProcessor.process_run()
+        apply_interpolation : bool
+            If True, apply interpolation to match metrics computation
+        interpolation_mode : str
+            Interpolation mode: "none", "linear", or "cubic"
+        dt : float
+            Time step between frames
             
         Returns
         -------
         List[Tuple[float, float]]
             List of (x, y) centroid positions
         """
-        trajectory = []
+        # Extract raw trajectory
+        raw_trajectory = []
+        frame_times = []
         for idx in sorted(results_by_index.keys()):
             result = results_by_index[idx]
             if result.bev_centroid is not None:
-                trajectory.append(result.bev_centroid)
-        return trajectory
+                raw_trajectory.append(result.bev_centroid)
+                frame_times.append(float(idx) * dt)
+        
+        if not apply_interpolation or interpolation_mode == "none" or len(raw_trajectory) < 3:
+            return raw_trajectory
+        
+        # Apply interpolation to match metrics computation
+        from scipy import interpolate as scipy_interp
+        
+        t = np.array(frame_times)
+        data = np.array(raw_trajectory)
+        t_interp = np.linspace(t[0], t[-1], len(t) * 3)
+        
+        if interpolation_mode == "linear":
+            interp_func = scipy_interp.interp1d(
+                t, data, kind='linear', axis=0,
+                bounds_error=False, fill_value=(data[0], data[-1])
+            )
+            data_interp = interp_func(t_interp)
+        elif interpolation_mode == "cubic" and len(t) >= 4:
+            interp_func = scipy_interp.CubicSpline(
+                t, data, axis=0, bc_type='natural', extrapolate=False
+            )
+            data_interp = interp_func(t_interp)
+            # Handle NaN from extrapolate=False
+            data_interp = np.where(
+                np.isnan(data_interp),
+                np.where(t_interp[:, None] < t[0], data[0], data[-1]),
+                data_interp
+            )
+        else:
+            return raw_trajectory
+        
+        return [tuple(pt) for pt in data_interp]
 
 
 class ErrorAnalysisPlotter:

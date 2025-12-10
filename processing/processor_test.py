@@ -187,7 +187,13 @@ def _load_ground_truth_csv() -> Dict[int, Dict[str, float]]:
 
 def _compute_lane_metrics_ground_truth(episode_idx: int, gt_data: Dict[int, Dict[str, float]],
                                       fractions: Tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)) -> LaneMetrics:
-    """Compute ground truth lane metrics for an episode."""
+    """
+    Compute ground truth lane metrics for an episode.
+    
+    BUG FIX #4: Use velocities directly from CSV (vx_units_per_sec, vy_units_per_sec)
+    instead of computing from world Y coordinate which is NOT lane-relative lateral.
+    The CSV provides pre-computed velocities that are more accurate.
+    """
     # Get all frames for this episode
     episode_frames = {k: v for k, v in gt_data.items() if v["episode_idx"] == episode_idx}
     if not episode_frames:
@@ -195,18 +201,22 @@ def _compute_lane_metrics_ground_truth(episode_idx: int, gt_data: Dict[int, Dict
 
     frame_indices = sorted(episode_frames.keys())
     lane_s_vals = [episode_frames[idx]["lane_s"] for idx in frame_indices]
-    x_vals = [episode_frames[idx]["x"] for idx in frame_indices]
+    
+    # BUG FIX #4: Use pre-computed velocities from CSV instead of gradient of world coords
+    # The CSV has vx_units_per_sec and vy_units_per_sec which are properly computed
+    vs = np.array([episode_frames[idx]["vx"] for idx in frame_indices])  # velocity along lane (vx from CSV)
+    vl = np.array([episode_frames[idx]["vy"] for idx in frame_indices])  # lateral velocity (vy from CSV)
+    
+    # Keep y_vals for total_break calculation (lateral position)
     y_vals = [episode_frames[idx]["y"] for idx in frame_indices]
-
+    
     # Find lane start/end
     lane_start_s = min(lane_s_vals)
     lane_end_s = max(lane_s_vals)
     lane_length = lane_end_s - lane_start_s
 
-    # Compute velocities and accelerations using finite differences
+    # Compute accelerations using finite differences on the provided velocities
     dt = 1.0 / 30.0  # 30 FPS
-    vs = np.gradient(lane_s_vals, dt)  # velocity along lane
-    vl = np.gradient(y_vals, dt)       # lateral velocity
     as_ = np.gradient(vs, dt)          # acceleration along lane
     al = np.gradient(vl, dt)           # lateral acceleration
 
@@ -741,6 +751,11 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
             # Extract BEV trajectory to find closest frames for fractions
             s_bev, l_bev, frames_with_ball = _extract_bev_axes(results_with_ball)
             
+            # BUG FIX #2: Apply sign correction based on s_axis_flipped flag
+            # If the s-axis was flipped in compute_lane_metrics, velocities have
+            # the opposite sign from what calibration expects
+            sign_correction = -1.0 if bev_metrics.s_axis_flipped else 1.0
+            
             for i, frac in enumerate(world_fractions):
                 s_bev_target = bev_metrics.frac_positions[i]
                 s_world = a_s * s_bev_target + b_s
@@ -748,11 +763,12 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
                 vx_bev, vy_bev, _ = bev_metrics.velocity_at_frac[i]
                 ax_bev, ay_bev, _ = bev_metrics.acceleration_at_frac[i]
 
-                vx_world = a_s * vx_bev
+                # Apply sign correction to align with calibration coordinate system
+                vx_world = a_s * vx_bev * sign_correction
                 vy_world = a_l * vy_bev
                 speed_world = float(np.hypot(vx_world, vy_world))
 
-                ax_world = a_s * ax_bev
+                ax_world = a_s * ax_bev * sign_correction
                 ay_world = a_l * ay_bev
                 accel_world = float(np.hypot(ax_world, ay_world))
 
@@ -934,15 +950,18 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
         world_vel_at_frac: List[Tuple[float, float, float]] = []
         world_acc_at_frac: List[Tuple[float, float, float]] = []
         
+        # Apply sign correction based on s_axis_flipped flag
+        sign_correction = -1.0 if bev_metrics.s_axis_flipped else 1.0
+        
         for i, frac in enumerate(bev_metrics.fractions):
             vx_bev, vy_bev, _ = bev_metrics.velocity_at_frac[i]
             ax_bev, ay_bev, _ = bev_metrics.acceleration_at_frac[i]
             
-            vx_world = a_s * vx_bev
+            vx_world = a_s * vx_bev * sign_correction
             vy_world = a_l * vy_bev
             speed_world = float(np.hypot(vx_world, vy_world))
             
-            ax_world = a_s * ax_bev
+            ax_world = a_s * ax_bev * sign_correction
             ay_world = a_l * ay_bev
             accel_world = float(np.hypot(ax_world, ay_world))
             
