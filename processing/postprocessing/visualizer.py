@@ -256,6 +256,190 @@ class TrajectoryVisualizer:
         
         return fig
     
+    def plot_averaged_trajectory(
+        self,
+        trajectories: Dict[str, List[Tuple[float, float]]],
+        lane_boundary: np.ndarray,
+        errors: Dict[str, Dict[str, float]],
+        output_path: Optional[Path] = None,
+    ) -> plt.Figure:
+        """
+        Create clean averaged trajectory plot across all interpolation modes.
+
+        Parameters
+        ----------
+        trajectories : Dict[str, List[Tuple[float, float]]]
+            Trajectories for each interpolation mode
+        lane_boundary : np.ndarray
+            Lane boundary points
+        errors : Dict[str, Dict[str, float]]
+            Error metrics for each mode (will be averaged)
+        output_path : Optional[Path]
+            If provided, save figure to this path
+
+        Returns
+        -------
+        plt.Figure
+            The generated figure
+        """
+        fig, ax = plt.subplots(figsize=(10, 14), dpi=150)
+        fig.patch.set_facecolor('white')
+        ax.set_facecolor('#F5F5F5')
+
+        # Plot lane boundary
+        if lane_boundary.size > 0:
+            lane_x = lane_boundary[:, 0]
+            lane_y = lane_boundary[:, 1]
+            ax.fill(lane_x, lane_y, color=self.COLORS['lane'], alpha=0.15, label='Lane')
+            ax.plot(lane_x, lane_y, color=self.COLORS['lane'],
+                   linewidth=2.5, linestyle='-', alpha=0.8)
+
+        # Compute averaged trajectory
+        modes = ['none', 'linear', 'cubic']
+        valid_trajectories = [np.array(trajectories[m]) for m in modes if m in trajectories and trajectories[m]]
+
+        if valid_trajectories:
+            # Find minimum length to align trajectories
+            min_len = min(len(t) for t in valid_trajectories)
+            aligned_trajectories = [t[:min_len] for t in valid_trajectories]
+
+            # Compute mean and std
+            traj_stack = np.stack(aligned_trajectories, axis=0)
+            traj_mean = np.mean(traj_stack, axis=0)
+            traj_std = np.std(traj_stack, axis=0)
+
+            # Extract coordinates
+            x_mean = traj_mean[:, 0]
+            y_mean = traj_mean[:, 1]
+            x_std = traj_std[:, 0]
+            y_std = traj_std[:, 1]
+
+            # Plot confidence band around trajectory
+            for i in range(len(x_mean) - 1):
+                ellipse = mpatches.Ellipse(
+                    (x_mean[i], y_mean[i]),
+                    width=2 * x_std[i],
+                    height=2 * y_std[i],
+                    alpha=0.15,
+                    color='#2196F3',
+                    zorder=1
+                )
+                ax.add_patch(ellipse)
+            # Add label for legend
+            ax.plot([], [], color='#2196F3', alpha=0.3, linewidth=10, label='±1 σ')
+
+            # Plot mean trajectory
+            ax.plot(
+                x_mean, y_mean,
+                color='#1565C0',
+                linewidth=4,
+                label='Mean Trajectory',
+                zorder=3
+            )
+
+            # Plot individual ball positions
+            ax.scatter(
+                x_mean, y_mean,
+                s=80,
+                color='#1976D2',
+                edgecolor='white',
+                linewidth=1.5,
+                alpha=0.7,
+                zorder=4
+            )
+
+            # Start marker
+            ax.scatter(
+                x_mean[0], y_mean[0],
+                s=300,
+                color='#4CAF50',
+                edgecolor='white',
+                linewidth=3,
+                marker='o',
+                label='Start',
+                zorder=6
+            )
+
+            # End marker
+            ax.scatter(
+                x_mean[-1], y_mean[-1],
+                s=300,
+                color='#F44336',
+                edgecolor='white',
+                linewidth=3,
+                marker='s',
+                label='End',
+                zorder=6
+            )
+
+            # Add direction arrows (fewer, cleaner)
+            n_arrows = 3
+            arrow_indices = np.linspace(0, len(x_mean) - 1, n_arrows + 2, dtype=int)[1:-1]
+            for idx in arrow_indices:
+                if idx < len(x_mean) - 1:
+                    dx = x_mean[idx + 1] - x_mean[idx]
+                    dy = y_mean[idx + 1] - y_mean[idx]
+                    ax.arrow(
+                        x_mean[idx], y_mean[idx], dx * 0.7, dy * 0.7,
+                        head_width=12, head_length=15,
+                        fc='#1565C0', ec='#1565C0',
+                        alpha=0.5, zorder=5, linewidth=2
+                    )
+
+        # Compute averaged errors
+        avg_errors = {}
+        for key in ['speed_error', 'accel_mag_error', 'total_break_error', 'end_speed_error', 'seg_map_50_95']:
+            values = [errors[m].get(key, 0) for m in modes if m in errors]
+            if values:
+                avg_errors[key] = np.mean(values)
+
+        # Add clean error summary
+        if avg_errors:
+            error_lines = ['Performance Metrics', '─' * 22]
+            if 'speed_error' in avg_errors:
+                error_lines.append(f'Speed MAE:     {abs(avg_errors["speed_error"]):7.2f}')
+            if 'accel_mag_error' in avg_errors:
+                error_lines.append(f'Accel MAE:     {abs(avg_errors["accel_mag_error"]):7.2f}')
+            if 'total_break_error' in avg_errors:
+                error_lines.append(f'Break Error:   {abs(avg_errors["total_break_error"]):7.3f}')
+            if 'seg_map_50_95' in avg_errors:
+                error_lines.append('─' * 22)
+                error_lines.append(f'mAP@50-95:     {avg_errors["seg_map_50_95"]:7.1%}')
+
+            error_text = '\n'.join(error_lines)
+            props = dict(boxstyle='round,pad=0.8', facecolor='white',
+                        edgecolor='#424242', alpha=0.95, linewidth=2)
+            ax.text(
+                0.03, 0.97, error_text,
+                transform=ax.transAxes,
+                fontsize=11,
+                verticalalignment='top',
+                bbox=props,
+                family='monospace',
+                color='#212121'
+            )
+
+        # Clean formatting
+        ax.set_xlabel('BEV X Coordinate (pixels)', fontsize=13, fontweight='bold', color='#212121')
+        ax.set_ylabel('BEV Y Coordinate (pixels)', fontsize=13, fontweight='bold', color='#212121')
+        ax.set_title('Ball Trajectory on Lane (Averaged)', fontsize=16, fontweight='bold', pad=20, color='#212121')
+
+        ax.legend(loc='lower right', fontsize=11, framealpha=0.95,
+                 edgecolor='#424242', fancybox=True, shadow=False)
+        ax.grid(True, alpha=0.25, color='#BDBDBD', linestyle='-', linewidth=0.8)
+        ax.set_aspect('equal', adjustable='box')
+
+        # Note: Remove y-axis inversion to fix ball positioning
+        # The BEV coordinates are already in the correct orientation
+
+        plt.tight_layout()
+
+        if output_path:
+            fig.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
+            print(f"Saved averaged trajectory plot: {output_path}")
+
+        return fig
+
     def plot_comparison(
         self,
         trajectories: Dict[str, List[Tuple[float, float]]],
@@ -265,7 +449,7 @@ class TrajectoryVisualizer:
     ) -> plt.Figure:
         """
         Create side-by-side comparison of all interpolation methods.
-        
+
         Parameters
         ----------
         trajectories : Dict[str, List[Tuple[float, float]]]
@@ -276,7 +460,7 @@ class TrajectoryVisualizer:
             Error metrics for each mode
         output_path : Optional[Path]
             If provided, save figure to this path
-            
+
         Returns
         -------
         plt.Figure
@@ -284,59 +468,59 @@ class TrajectoryVisualizer:
         """
         fig = plt.figure(figsize=(18, 12), dpi=150)
         fig.patch.set_facecolor('white')
-        
+
         modes = ['none', 'linear', 'cubic']
         mode_titles = ['No Interpolation', 'Piecewise Linear', 'Cubic Spline']
-        
+
         for idx, (mode, mode_title) in enumerate(zip(modes, mode_titles)):
             ax = fig.add_subplot(1, 3, idx + 1)
             ax.set_facecolor('#FAFAFA')
-            
+
             # Plot lane boundary
             if lane_boundary.size > 0:
                 lane_x = lane_boundary[:, 0]
                 lane_y = lane_boundary[:, 1]
                 ax.fill(lane_x, lane_y, color=self.COLORS['lane'], alpha=0.3)
-                ax.plot(lane_x, lane_y, color=self.COLORS['lane'], 
+                ax.plot(lane_x, lane_y, color=self.COLORS['lane'],
                        linewidth=2, linestyle='--', label='Lane')
-            
+
             # Plot trajectory if available
             if mode in trajectories and trajectories[mode]:
                 traj_array = np.array(trajectories[mode])
                 traj_x = traj_array[:, 0]
                 traj_y = traj_array[:, 1]
-                
+
                 color_map = {
                     'none': self.COLORS['trajectory_none'],
                     'linear': self.COLORS['trajectory_linear'],
                     'cubic': self.COLORS['trajectory_cubic'],
                 }
                 traj_color = color_map.get(mode, self.COLORS['trajectory_none'])
-                
+
                 ax.plot(traj_x, traj_y, color=traj_color, linewidth=3,
                        marker='o', markersize=4, markerfacecolor=traj_color,
-                       markeredgecolor='white', markeredgewidth=0.5, 
+                       markeredgecolor='white', markeredgewidth=0.5,
                        alpha=0.9, label='Trajectory')
-                
+
                 # Start/end markers
-                ax.scatter(traj_x[0], traj_y[0], s=200, 
-                          color=self.COLORS['start_marker'], 
-                          edgecolor='white', linewidth=2, marker='o', 
+                ax.scatter(traj_x[0], traj_y[0], s=200,
+                          color=self.COLORS['start_marker'],
+                          edgecolor='white', linewidth=2, marker='o',
                           label='Start', zorder=5)
-                ax.scatter(traj_x[-1], traj_y[-1], s=200, 
-                          color=self.COLORS['end_marker'], 
-                          edgecolor='white', linewidth=2, marker='s', 
+                ax.scatter(traj_x[-1], traj_y[-1], s=200,
+                          color=self.COLORS['end_marker'],
+                          edgecolor='white', linewidth=2, marker='s',
                           label='End', zorder=5)
-            
+
             # Add error text
             if mode in errors:
                 error_text = self._format_error_text(errors[mode], mode)
-                props = dict(boxstyle='round,pad=0.6', facecolor='white', 
+                props = dict(boxstyle='round,pad=0.6', facecolor='white',
                            edgecolor=self.COLORS['text'], alpha=0.95, linewidth=1.5)
                 ax.text(0.02, 0.98, error_text, transform=ax.transAxes,
                        fontsize=9, verticalalignment='top', bbox=props,
                        family='monospace', color=self.COLORS['text'])
-            
+
             # Formatting
             ax.set_xlabel('BEV X (pixels)', fontsize=11, fontweight='bold')
             if idx == 0:
@@ -346,15 +530,15 @@ class TrajectoryVisualizer:
             ax.grid(True, alpha=0.3, color=self.COLORS['grid'])
             ax.set_aspect('equal', adjustable='box')
             ax.invert_yaxis()
-        
-        fig.suptitle('Trajectory Comparison: Interpolation Methods', 
+
+        fig.suptitle('Trajectory Comparison: Interpolation Methods',
                     fontsize=16, fontweight='bold', y=0.98)
         plt.tight_layout(rect=[0, 0, 1, 0.96])
-        
+
         if output_path:
             fig.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
             print(f"Saved comparison plot: {output_path}")
-        
+
         return fig
     
     def _format_error_text(self, errors: Dict[str, float], mode: str) -> str:
@@ -427,135 +611,95 @@ class ErrorAnalysisPlotter:
         output_path: Optional[Path] = None,
     ) -> plt.Figure:
         """
-        Create comprehensive error analysis plots.
-        
+        Create simplified error analysis plot (averaged across modes).
+
         Parameters
         ----------
         csv_data : List[Dict]
             Parsed CSV data with error metrics
         output_path : Optional[Path]
             If provided, save figure to this path
-            
+
         Returns
         -------
         plt.Figure
             The generated figure
         """
-        fig = plt.figure(figsize=(16, 10), dpi=150)
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6), dpi=150)
         fig.patch.set_facecolor('white')
-        gs = GridSpec(3, 3, figure=fig, hspace=0.35, wspace=0.3)
-        
+
         # Organize data by mode
         modes = ['none', 'linear', 'cubic']
-        mode_colors = {
-            'none': ErrorAnalysisPlotter.COLORS['trajectory_none'],
-            'linear': ErrorAnalysisPlotter.COLORS['trajectory_linear'],
-            'cubic': ErrorAnalysisPlotter.COLORS['trajectory_cubic'],
-        }
-        
+
         data_by_mode = {mode: [] for mode in modes}
         for row in csv_data:
             mode = row.get('interpolation_mode')
-            if mode in modes and row.get('fraction') != 'episode_total':
+            if mode in modes and row.get('fraction') != 'episode_total' and row.get('fraction') not in ['averages', 'mae']:
                 try:
                     data_by_mode[mode].append({
                         'fraction': float(row.get('fraction', 0)),
                         'speed_error': float(row.get('speed_error', 0)),
                         'accel_mag_error': float(row.get('accel_mag_error', 0)),
-                        'vel_x_error': float(row.get('vel_x_error', 0)),
-                        'vel_y_error': float(row.get('vel_y_error', 0)),
-                        'acc_x_error': float(row.get('acc_x_error', 0)),
-                        'acc_y_error': float(row.get('acc_y_error', 0)),
                     })
                 except (ValueError, TypeError):
                     continue
-        
-        # 1. Speed Error vs Lane Fraction
-        ax1 = fig.add_subplot(gs[0, :])
-        ax1.set_facecolor('#FAFAFA')
-        for mode in modes:
-            if data_by_mode[mode]:
-                fractions = [d['fraction'] for d in data_by_mode[mode]]
-                speed_errors = [abs(d['speed_error']) for d in data_by_mode[mode]]
-                ax1.plot(fractions, speed_errors, 'o-', linewidth=2, markersize=6,
-                        label=mode.capitalize(), color=mode_colors[mode], alpha=0.8)
-        ax1.set_xlabel('Lane Fraction', fontsize=11, fontweight='bold')
-        ax1.set_ylabel('|Speed Error| (units/s)', fontsize=11, fontweight='bold')
-        ax1.set_title('Speed Error Along Lane', fontsize=13, fontweight='bold')
-        ax1.legend(fontsize=10)
-        ax1.grid(True, alpha=0.3, color=ErrorAnalysisPlotter.COLORS['grid'])
-        
-        # 2. Acceleration Error vs Lane Fraction
-        ax2 = fig.add_subplot(gs[1, :])
-        ax2.set_facecolor('#FAFAFA')
-        for mode in modes:
-            if data_by_mode[mode]:
-                fractions = [d['fraction'] for d in data_by_mode[mode]]
-                accel_errors = [abs(d['accel_mag_error']) for d in data_by_mode[mode]]
-                ax2.plot(fractions, accel_errors, 's-', linewidth=2, markersize=6,
-                        label=mode.capitalize(), color=mode_colors[mode], alpha=0.8)
-        ax2.set_xlabel('Lane Fraction', fontsize=11, fontweight='bold')
-        ax2.set_ylabel('|Accel Error| (units/s²)', fontsize=11, fontweight='bold')
-        ax2.set_title('Acceleration Error Along Lane', fontsize=13, fontweight='bold')
-        ax2.legend(fontsize=10)
-        ax2.grid(True, alpha=0.3, color=ErrorAnalysisPlotter.COLORS['grid'])
-        
-        # 3. Error Distribution - Speed
-        ax3 = fig.add_subplot(gs[2, 0])
-        ax3.set_facecolor('#FAFAFA')
-        speed_errors_by_mode = []
-        labels = []
-        for mode in modes:
-            if data_by_mode[mode]:
-                speed_errors_by_mode.append([abs(d['speed_error']) for d in data_by_mode[mode]])
-                labels.append(mode.capitalize())
-        bp1 = ax3.boxplot(speed_errors_by_mode, labels=labels, patch_artist=True)
-        for patch, mode in zip(bp1['boxes'], modes):
-            patch.set_facecolor(mode_colors[mode])
-            patch.set_alpha(0.6)
-        ax3.set_ylabel('|Speed Error|', fontsize=10, fontweight='bold')
-        ax3.set_title('Speed Error Distribution', fontsize=11, fontweight='bold')
-        ax3.grid(True, alpha=0.3, axis='y', color=ErrorAnalysisPlotter.COLORS['grid'])
-        
-        # 4. Error Distribution - Acceleration
-        ax4 = fig.add_subplot(gs[2, 1])
-        ax4.set_facecolor('#FAFAFA')
-        accel_errors_by_mode = []
-        for mode in modes:
-            if data_by_mode[mode]:
-                accel_errors_by_mode.append([abs(d['accel_mag_error']) for d in data_by_mode[mode]])
-        bp2 = ax4.boxplot(accel_errors_by_mode, labels=labels, patch_artist=True)
-        for patch, mode in zip(bp2['boxes'], modes):
-            patch.set_facecolor(mode_colors[mode])
-            patch.set_alpha(0.6)
-        ax4.set_ylabel('|Accel Error|', fontsize=10, fontweight='bold')
-        ax4.set_title('Accel Error Distribution', fontsize=11, fontweight='bold')
-        ax4.grid(True, alpha=0.3, axis='y', color=ErrorAnalysisPlotter.COLORS['grid'])
-        
-        # 5. Error Correlation (Vel X vs Vel Y)
-        ax5 = fig.add_subplot(gs[2, 2])
-        ax5.set_facecolor('#FAFAFA')
-        for mode in modes:
-            if data_by_mode[mode]:
-                vel_x_errors = [d['vel_x_error'] for d in data_by_mode[mode]]
-                vel_y_errors = [d['vel_y_error'] for d in data_by_mode[mode]]
-                ax5.scatter(vel_x_errors, vel_y_errors, s=50, alpha=0.6,
-                           label=mode.capitalize(), color=mode_colors[mode])
-        ax5.axhline(0, color='k', linestyle='--', linewidth=0.8, alpha=0.3)
-        ax5.axvline(0, color='k', linestyle='--', linewidth=0.8, alpha=0.3)
-        ax5.set_xlabel('Vel X Error', fontsize=10, fontweight='bold')
-        ax5.set_ylabel('Vel Y Error', fontsize=10, fontweight='bold')
-        ax5.set_title('Velocity Error Correlation', fontsize=11, fontweight='bold')
-        ax5.legend(fontsize=9)
-        ax5.grid(True, alpha=0.3, color=ErrorAnalysisPlotter.COLORS['grid'])
-        
-        fig.suptitle('End-to-End Performance Analysis', 
-                    fontsize=16, fontweight='bold', y=0.995)
-        
+
+        # Compute averaged errors across modes
+        all_fractions = sorted(set(
+            d['fraction'] for mode_data in data_by_mode.values()
+            for d in mode_data
+        ))
+
+        avg_speed_errors = []
+        avg_accel_errors = []
+
+        for frac in all_fractions:
+            speed_vals = []
+            accel_vals = []
+            for mode in modes:
+                mode_data = [d for d in data_by_mode[mode] if abs(d['fraction'] - frac) < 0.01]
+                if mode_data:
+                    speed_vals.append(abs(mode_data[0]['speed_error']))
+                    accel_vals.append(abs(mode_data[0]['accel_mag_error']))
+
+            if speed_vals:
+                avg_speed_errors.append(np.mean(speed_vals))
+                avg_accel_errors.append(np.mean(accel_vals))
+
+        # Plot 1: Speed Error
+        ax1 = axes[0]
+        ax1.set_facecolor('#F5F5F5')
+        if avg_speed_errors:
+            ax1.plot(all_fractions, avg_speed_errors, 'o-',
+                    linewidth=3, markersize=8,
+                    color='#1976D2', markerfacecolor='#1976D2',
+                    markeredgecolor='white', markeredgewidth=2)
+        ax1.set_xlabel('Lane Fraction', fontsize=12, fontweight='bold')
+        ax1.set_ylabel('Speed Error (units/s)', fontsize=12, fontweight='bold')
+        ax1.set_title('Average Speed Error Along Lane', fontsize=14, fontweight='bold', pad=15)
+        ax1.grid(True, alpha=0.3, color='#BDBDBD', linestyle='-', linewidth=0.8)
+
+        # Plot 2: Acceleration Error
+        ax2 = axes[1]
+        ax2.set_facecolor('#F5F5F5')
+        if avg_accel_errors:
+            ax2.plot(all_fractions, avg_accel_errors, 's-',
+                    linewidth=3, markersize=8,
+                    color='#F57C00', markerfacecolor='#F57C00',
+                    markeredgecolor='white', markeredgewidth=2)
+        ax2.set_xlabel('Lane Fraction', fontsize=12, fontweight='bold')
+        ax2.set_ylabel('Accel Error (units/s²)', fontsize=12, fontweight='bold')
+        ax2.set_title('Average Acceleration Error Along Lane', fontsize=14, fontweight='bold', pad=15)
+        ax2.grid(True, alpha=0.3, color='#BDBDBD', linestyle='-', linewidth=0.8)
+
+        fig.suptitle('Performance Metrics (Averaged Across Interpolation Modes)',
+                    fontsize=16, fontweight='bold', y=0.98)
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+
         if output_path:
             fig.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
             print(f"Saved error analysis plot: {output_path}")
-        
+
         return fig
     
     @staticmethod
@@ -564,157 +708,79 @@ class ErrorAnalysisPlotter:
         output_path: Optional[Path] = None,
     ) -> plt.Figure:
         """
-        Create summary metrics comparison bar chart.
-        
+        Create simplified summary metrics bar chart (averaged across modes).
+
         Parameters
         ----------
         csv_data : List[Dict]
             Parsed CSV data including summary statistics
         output_path : Optional[Path]
             If provided, save figure to this path
-            
+
         Returns
         -------
         plt.Figure
             The generated figure
         """
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10), dpi=150)
+        fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
         fig.patch.set_facecolor('white')
-        
+        ax.set_facecolor('#F5F5F5')
+
         modes = ['none', 'linear', 'cubic']
-        mode_colors = {
-            'none': ErrorAnalysisPlotter.COLORS['trajectory_none'],
-            'linear': ErrorAnalysisPlotter.COLORS['trajectory_linear'],
-            'cubic': ErrorAnalysisPlotter.COLORS['trajectory_cubic'],
-        }
-        
-        # Extract summary statistics
+
+        # Extract summary statistics and compute averages
         summary_data = {mode: {} for mode in modes}
         for row in csv_data:
             if row.get('test_name') == 'summary_statistics':
                 mode = row.get('interpolation_mode')
                 stat_type = row.get('fraction')  # 'averages' or 'mae'
-                if mode in modes and stat_type in ['averages', 'mae']:
-                    if stat_type not in summary_data[mode]:
-                        summary_data[mode][stat_type] = {}
+                if mode in modes and stat_type == 'mae':
                     try:
-                        summary_data[mode][stat_type].update({
-                            'vel_x_error': abs(float(row.get('vel_x_error', 0))),
-                            'vel_y_error': abs(float(row.get('vel_y_error', 0))),
-                            'speed_error': abs(float(row.get('speed_error', 0))),
-                            'acc_x_error': abs(float(row.get('acc_x_error', 0))),
-                            'acc_y_error': abs(float(row.get('acc_y_error', 0))),
-                            'accel_mag_error': abs(float(row.get('accel_mag_error', 0))),
-                            'total_break_error': abs(float(row.get('total_break_error', 0))),
-                            'end_speed_error': abs(float(row.get('end_speed_error', 0))),
-                        })
+                        summary_data[mode] = {
+                            'speed_error': abs(float(row.get('pred_speed', 0))),
+                            'accel_mag_error': abs(float(row.get('pred_accel_mag', 0))),
+                            'total_break_error': abs(float(row.get('pred_total_break', 0))),
+                            'end_speed_error': abs(float(row.get('pred_end_speed', 0))),
+                        }
                     except (ValueError, TypeError):
                         continue
-        
-        # Plot MAE metrics
-        ax1 = axes[0, 0]
-        ax1.set_facecolor('#FAFAFA')
-        metrics = ['vel_x_error', 'vel_y_error', 'speed_error']
-        metric_labels = ['Vel X', 'Vel Y', 'Speed']
-        x = np.arange(len(metric_labels))
-        width = 0.25
-        
-        for i, mode in enumerate(modes):
-            if 'mae' in summary_data[mode]:
-                values = [summary_data[mode]['mae'].get(m, 0) for m in metrics]
-                ax1.bar(x + i * width, values, width, label=mode.capitalize(),
-                       color=mode_colors[mode], alpha=0.8)
-        
-        ax1.set_xlabel('Metric', fontsize=11, fontweight='bold')
-        ax1.set_ylabel('MAE', fontsize=11, fontweight='bold')
-        ax1.set_title('Velocity Error (MAE)', fontsize=12, fontweight='bold')
-        ax1.set_xticks(x + width)
-        ax1.set_xticklabels(metric_labels)
-        ax1.legend(fontsize=10)
-        ax1.grid(True, alpha=0.3, axis='y', color=ErrorAnalysisPlotter.COLORS['grid'])
-        
-        # Plot acceleration MAE
-        ax2 = axes[0, 1]
-        ax2.set_facecolor('#FAFAFA')
-        metrics = ['acc_x_error', 'acc_y_error', 'accel_mag_error']
-        metric_labels = ['Acc X', 'Acc Y', 'Acc Mag']
-        x = np.arange(len(metric_labels))
-        
-        for i, mode in enumerate(modes):
-            if 'mae' in summary_data[mode]:
-                values = [summary_data[mode]['mae'].get(m, 0) for m in metrics]
-                ax2.bar(x + i * width, values, width, label=mode.capitalize(),
-                       color=mode_colors[mode], alpha=0.8)
-        
-        ax2.set_xlabel('Metric', fontsize=11, fontweight='bold')
-        ax2.set_ylabel('MAE', fontsize=11, fontweight='bold')
-        ax2.set_title('Acceleration Error (MAE)', fontsize=12, fontweight='bold')
-        ax2.set_xticks(x + width)
-        ax2.set_xticklabels(metric_labels)
-        ax2.legend(fontsize=10)
-        ax2.grid(True, alpha=0.3, axis='y', color=ErrorAnalysisPlotter.COLORS['grid'])
-        
-        # Plot position errors
-        ax3 = axes[1, 0]
-        ax3.set_facecolor('#FAFAFA')
-        metrics = ['total_break_error', 'end_speed_error']
-        metric_labels = ['Break Error', 'End Speed']
-        x = np.arange(len(metric_labels))
-        
-        for i, mode in enumerate(modes):
-            if 'mae' in summary_data[mode]:
-                values = [summary_data[mode]['mae'].get(m, 0) for m in metrics]
-                ax3.bar(x + i * width, values, width, label=mode.capitalize(),
-                       color=mode_colors[mode], alpha=0.8)
-        
-        ax3.set_xlabel('Metric', fontsize=11, fontweight='bold')
-        ax3.set_ylabel('MAE', fontsize=11, fontweight='bold')
-        ax3.set_title('Position & End Speed Error (MAE)', fontsize=12, fontweight='bold')
-        ax3.set_xticks(x + width)
-        ax3.set_xticklabels(metric_labels)
-        ax3.legend(fontsize=10)
-        ax3.grid(True, alpha=0.3, axis='y', color=ErrorAnalysisPlotter.COLORS['grid'])
-        
-        # Overall performance comparison (normalized)
-        ax4 = axes[1, 1]
-        ax4.set_facecolor('#FAFAFA')
-        
-        # Calculate overall error score (lower is better)
-        overall_scores = []
-        for mode in modes:
-            if 'mae' in summary_data[mode]:
-                score = (
-                    summary_data[mode]['mae'].get('speed_error', 0) +
-                    summary_data[mode]['mae'].get('accel_mag_error', 0) / 10 +  # Scale down accel
-                    summary_data[mode]['mae'].get('total_break_error', 0) * 10  # Scale up break
-                )
-                overall_scores.append(score)
+
+        # Compute average across modes
+        metric_keys = ['speed_error', 'accel_mag_error', 'total_break_error', 'end_speed_error']
+        metric_labels = ['Speed\n(units/s)', 'Acceleration\n(units/s²)', 'Break\n(units)', 'End Speed\n(units/s)']
+        avg_values = []
+
+        for key in metric_keys:
+            values = [summary_data[mode].get(key, 0) for mode in modes if mode in summary_data and key in summary_data[mode]]
+            if values:
+                avg_values.append(np.mean(values))
             else:
-                overall_scores.append(0)
-        
-        x = np.arange(len(modes))
-        bars = ax4.bar(x, overall_scores, color=[mode_colors[m] for m in modes], alpha=0.8)
-        ax4.set_xlabel('Interpolation Mode', fontsize=11, fontweight='bold')
-        ax4.set_ylabel('Composite Error Score', fontsize=11, fontweight='bold')
-        ax4.set_title('Overall Performance (Lower is Better)', fontsize=12, fontweight='bold')
-        ax4.set_xticks(x)
-        ax4.set_xticklabels([m.capitalize() for m in modes])
-        ax4.grid(True, alpha=0.3, axis='y', color=ErrorAnalysisPlotter.COLORS['grid'])
-        
+                avg_values.append(0)
+
+        # Create bar chart
+        colors = ['#1976D2', '#F57C00', '#388E3C', '#7B1FA2']
+        x = np.arange(len(metric_labels))
+        bars = ax.bar(x, avg_values, color=colors, alpha=0.8, edgecolor='white', linewidth=2)
+
         # Add value labels on bars
         for bar in bars:
             height = bar.get_height()
-            ax4.text(bar.get_x() + bar.get_width() / 2., height,
-                    f'{height:.2f}',
-                    ha='center', va='bottom', fontsize=10, fontweight='bold')
-        
-        fig.suptitle('Summary Performance Metrics', 
-                    fontsize=16, fontweight='bold', y=0.995)
-        plt.tight_layout(rect=[0, 0, 1, 0.98])
-        
+            ax.text(bar.get_x() + bar.get_width() / 2., height,
+                   f'{height:.3f}',
+                   ha='center', va='bottom', fontsize=11, fontweight='bold')
+
+        ax.set_xlabel('Metric Type', fontsize=13, fontweight='bold')
+        ax.set_ylabel('Mean Absolute Error', fontsize=13, fontweight='bold')
+        ax.set_title('Average Performance Metrics Across All Modes', fontsize=15, fontweight='bold', pad=20)
+        ax.set_xticks(x)
+        ax.set_xticklabels(metric_labels, fontsize=11)
+        ax.grid(True, alpha=0.3, axis='y', color='#BDBDBD', linestyle='-', linewidth=0.8)
+
+        plt.tight_layout()
+
         if output_path:
             fig.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
             print(f"Saved summary metrics plot: {output_path}")
-        
+
         return fig
 

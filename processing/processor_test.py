@@ -984,29 +984,16 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
         
         errors_by_mode[interp_mode] = avg_errors
     
-    # Generate individual trajectory plots
-    print("\nGenerating individual trajectory plots...")
-    for mode in interpolation_modes:
-        output_path = viz_output_dir / f"trajectory_{mode}.png"
-        viz.plot_single_trajectory(
-            trajectory=trajectories_by_mode[mode],
-            lane_boundary=lane_boundary,
-            interpolation_mode=mode,
-            errors=errors_by_mode[mode],
-            output_path=output_path,
-        )
-        plt.close()  # Close to free memory
-    
-    # Generate comparison plot
-    print("Generating comparison plot...")
-    comparison_path = viz_output_dir / "trajectory_comparison.png"
-    viz.plot_comparison(
+    # Generate averaged trajectory plot (main visualization)
+    print("\nGenerating averaged trajectory plot...")
+    averaged_path = viz_output_dir / "trajectory_averaged.png"
+    viz.plot_averaged_trajectory(
         trajectories=trajectories_by_mode,
         lane_boundary=lane_boundary,
         errors=errors_by_mode,
-        output_path=comparison_path,
+        output_path=averaged_path,
     )
-    plt.close()
+    plt.close()  # Close to free memory
     
     # Generate error analysis plots from CSV
     print("Generating error analysis plots...")
@@ -1035,11 +1022,8 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
     print(f"{'='*60}")
     print(f"Output directory: {viz_output_dir}")
     print("\nGenerated files:")
-    print(f"  1. trajectory_none.png      - Raw trajectory (no interpolation)")
-    print(f"  2. trajectory_linear.png    - Piecewise linear interpolation")
-    print(f"  3. trajectory_cubic.png     - Cubic spline interpolation")
-    print(f"  4. trajectory_comparison.png - Side-by-side comparison")
-    print(f"  5. error_analysis.png       - Detailed error analysis plots")
-    print(f"  6. summary_metrics.png      - Summary performance metrics")
-    print(f"\nThese files are ready for your presentation!")
+    print(f"  1. trajectory_averaged.png  - Clean averaged ball trajectory on lane")
+    print(f"  2. error_analysis.png       - Speed & acceleration error analysis")
+    print(f"  3. summary_metrics.png      - Performance metrics summary")
+    print(f"\nVisualization shows averaged results across all interpolation modes.")
     print(f"{'='*60}\n")

@@ -17,7 +17,7 @@ class EpisodeRunResult:
     results_by_index: Dict[int, ProcessResult]
     homography: np.ndarray
     lane_metrics: LaneMetrics
-    raw_masks_by_index: Dict[int, Dict[str, np.ndarray]]  # Raw masks before warping for mAP calculation
+    raw_masks_by_index: Dict[int, Dict[str, np.ndarray]]
 
 
 class Processor:
