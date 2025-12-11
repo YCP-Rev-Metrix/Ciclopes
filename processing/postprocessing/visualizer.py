@@ -5,6 +5,7 @@ Generates publication-quality plots showing:
 - Lane boundaries in BEV space
 - Ball trajectory with different interpolation modes
 - Error overlays and metrics
+- BEV coordinate errors vs ground truth
 """
 from __future__ import annotations
 import numpy as np
@@ -12,10 +13,10 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 import cv2
 
-from .postprocessor import ProcessResult
+from .postprocessor import ProcessResult, LaneMetrics
 
 
 class TrajectoryVisualizer:
@@ -403,14 +404,14 @@ class TrajectoryVisualizer:
         if avg_errors:
             error_lines = ['Performance Metrics', '─' * 22]
             if 'speed_error' in avg_errors:
-                error_lines.append(f'Speed MAE:     {abs(avg_errors["speed_error"]):7.2f}')
+                error_lines.append(f'Speed MAE:     {abs(avg_errors["speed_error"]):6.2f} m/s')
             if 'accel_mag_error' in avg_errors:
-                error_lines.append(f'Accel MAE:     {abs(avg_errors["accel_mag_error"]):7.2f}')
+                error_lines.append(f'Accel MAE:     {abs(avg_errors["accel_mag_error"]):6.2f} m/s²')
             if 'total_break_error' in avg_errors:
-                error_lines.append(f'Break Error:   {abs(avg_errors["total_break_error"]):7.3f}')
+                error_lines.append(f'Break Error:   {abs(avg_errors["total_break_error"]):6.3f} m')
             if 'seg_map_50_95' in avg_errors:
                 error_lines.append('─' * 22)
-                error_lines.append(f'mAP@50-95:     {avg_errors["seg_map_50_95"]:7.1%}')
+                error_lines.append(f'mAP@50-95:     {avg_errors["seg_map_50_95"]:6.1%}')
 
             error_text = '\n'.join(error_lines)
             props = dict(boxstyle='round,pad=0.8', facecolor='white',
@@ -554,32 +555,538 @@ class TrajectoryVisualizer:
         lines = [f"Mode: {mode.upper()}"]
         lines.append("─" * 25)
         
-        # Velocity errors
-        if 'vel_x_error' in errors:
-            lines.append(f"Vel X Error: {errors['vel_x_error']:>8.2f}")
-        if 'vel_y_error' in errors:
-            lines.append(f"Vel Y Error: {errors['vel_y_error']:>8.2f}")
+        # Velocity errors (lane coordinates: s=along-lane, l=lateral)
+        if 'vel_s_error' in errors:
+            lines.append(f"Lane Vel Err: {errors['vel_s_error']:>7.2f} m/s")
+        if 'vel_l_error' in errors:
+            lines.append(f"Lat Vel Err:  {errors['vel_l_error']:>7.2f} m/s")
         if 'speed_error' in errors:
-            lines.append(f"Speed Error: {errors['speed_error']:>8.2f}")
+            lines.append(f"Speed Error:  {errors['speed_error']:>7.2f} m/s")
         
         # Acceleration errors
-        if 'acc_x_error' in errors:
-            lines.append(f"Acc X Error: {errors['acc_x_error']:>8.2f}")
-        if 'acc_y_error' in errors:
-            lines.append(f"Acc Y Error: {errors['acc_y_error']:>8.2f}")
         if 'accel_mag_error' in errors:
-            lines.append(f"Acc Mag Err: {errors['accel_mag_error']:>8.2f}")
+            lines.append(f"Accel Error:  {errors['accel_mag_error']:>7.2f} m/s²")
         
         # Position errors
         if 'total_break_error' in errors:
-            lines.append(f"Break Error:  {errors['total_break_error']:>7.3f}")
+            lines.append(f"Break Error:  {errors['total_break_error']:>7.3f} m")
         if 'end_speed_error' in errors:
-            lines.append(f"End Spd Err: {errors['end_speed_error']:>8.2f}")
+            lines.append(f"End Spd Err:  {errors['end_speed_error']:>7.2f} m/s")
+        
+        # BEV coordinate errors (new)
+        if 'bev_x_rmse' in errors:
+            lines.append("─" * 25)
+            lines.append(f"BEV X RMSE:   {errors['bev_x_rmse']:>7.2f} px")
+        if 'bev_y_rmse' in errors:
+            lines.append(f"BEV Y RMSE:   {errors['bev_y_rmse']:>7.2f} px")
+        if 'bev_total_rmse' in errors:
+            lines.append(f"BEV Tot RMSE: {errors['bev_total_rmse']:>7.2f} px")
         
         # Detection quality
         if 'seg_map_50_95' in errors:
             lines.append("─" * 25)
-            lines.append(f"mAP@50-95:   {errors['seg_map_50_95']:>8.2%}")
+            lines.append(f"mAP@50-95:    {errors['seg_map_50_95']:>7.1%}")
+        
+        return '\n'.join(lines)
+    
+    def plot_single_mode_trajectory(
+        self,
+        trajectory: List[Tuple[float, float]],
+        gt_trajectory: Optional[List[Tuple[float, float]]],
+        lane_boundary: np.ndarray,
+        mode: str,
+        errors: Dict[str, float],
+        bev_errors: Dict[str, float],
+        output_path: Optional[Path] = None,
+    ) -> plt.Figure:
+        """
+        Create a single trajectory visualization for one interpolation mode.
+        
+        Layout: Lane plot on left (large), metrics table on right.
+        
+        Parameters
+        ----------
+        trajectory : List[Tuple[float, float]]
+            Trajectory points for this mode
+        gt_trajectory : Optional[List[Tuple[float, float]]]
+            Ground truth trajectory in BEV coordinates
+        lane_boundary : np.ndarray
+            Lane boundary points as (N, 2) array
+        mode : str
+            Interpolation mode: "none", "linear", or "cubic"
+        errors : Dict[str, float]
+            World/lane coordinate error metrics
+        bev_errors : Dict[str, float]
+            BEV coordinate error metrics
+        output_path : Optional[Path]
+            If provided, save figure to this path
+            
+        Returns
+        -------
+        plt.Figure
+            The generated figure
+        """
+        mode_titles = {
+            'none': 'No Interpolation',
+            'linear': 'Linear Interpolation', 
+            'cubic': 'Cubic Spline',
+        }
+        mode_colors = {
+            'none': self.COLORS['trajectory_none'],
+            'linear': self.COLORS['trajectory_linear'],
+            'cubic': self.COLORS['trajectory_cubic'],
+        }
+        
+        # Create figure with lane on left, metrics on right
+        fig = plt.figure(figsize=(16, 10), dpi=150)
+        fig.patch.set_facecolor('#FAFAFA')
+        
+        # GridSpec: lane plot takes 70%, metrics table takes 30%
+        gs = GridSpec(1, 2, figure=fig, width_ratios=[2.5, 1], wspace=0.05)
+        
+        # Left panel: Lane and trajectory
+        ax_lane = fig.add_subplot(gs[0, 0])
+        self._plot_lane_panel(
+            ax=ax_lane,
+            trajectory=trajectory,
+            gt_trajectory=gt_trajectory,
+            lane_boundary=lane_boundary,
+            color=mode_colors.get(mode, self.COLORS['trajectory_none']),
+        )
+        
+        # Right panel: Metrics table
+        ax_metrics = fig.add_subplot(gs[0, 1])
+        self._plot_metrics_panel(
+            ax=ax_metrics,
+            mode=mode,
+            errors=errors,
+            bev_errors=bev_errors,
+        )
+        
+        fig.suptitle(
+            f'Ball Trajectory Analysis: {mode_titles.get(mode, mode.upper())}',
+            fontsize=16, fontweight='bold', y=0.98, color='#212121'
+        )
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        
+        if output_path:
+            fig.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='#FAFAFA')
+            print(f"Saved {mode} trajectory plot: {output_path}")
+        
+        return fig
+    
+    def plot_overlay_trajectory(
+        self,
+        trajectories: Dict[str, List[Tuple[float, float]]],
+        gt_trajectory: Optional[List[Tuple[float, float]]],
+        lane_boundary: np.ndarray,
+        errors_by_mode: Dict[str, Dict[str, float]],
+        bev_errors_by_mode: Dict[str, Dict[str, float]],
+        output_path: Optional[Path] = None,
+    ) -> plt.Figure:
+        """
+        Create overlay plot showing all interpolation modes together.
+        
+        Layout: Lane plot with all trajectories on left, comparison table on right.
+        
+        Parameters
+        ----------
+        trajectories : Dict[str, List[Tuple[float, float]]]
+            Trajectories for each interpolation mode
+        gt_trajectory : Optional[List[Tuple[float, float]]]
+            Ground truth trajectory in BEV coordinates
+        lane_boundary : np.ndarray
+            Lane boundary points as (N, 2) array
+        errors_by_mode : Dict[str, Dict[str, float]]
+            World/lane coordinate error metrics for each mode
+        bev_errors_by_mode : Dict[str, Dict[str, float]]
+            BEV coordinate error metrics for each mode
+        output_path : Optional[Path]
+            If provided, save figure to this path
+            
+        Returns
+        -------
+        plt.Figure
+            The generated figure
+        """
+        mode_colors = {
+            'none': self.COLORS['trajectory_none'],
+            'linear': self.COLORS['trajectory_linear'],
+            'cubic': self.COLORS['trajectory_cubic'],
+        }
+        
+        # Create figure with lane on left, comparison table on right
+        fig = plt.figure(figsize=(18, 10), dpi=150)
+        fig.patch.set_facecolor('#FAFAFA')
+        
+        # GridSpec: lane plot takes 65%, metrics table takes 35%
+        gs = GridSpec(1, 2, figure=fig, width_ratios=[2, 1.2], wspace=0.08)
+        
+        # Left panel: Lane with all trajectories overlaid
+        ax_lane = fig.add_subplot(gs[0, 0])
+        self._plot_overlay_lane_panel(
+            ax=ax_lane,
+            trajectories=trajectories,
+            gt_trajectory=gt_trajectory,
+            lane_boundary=lane_boundary,
+            mode_colors=mode_colors,
+        )
+        
+        # Right panel: Comparison metrics table
+        ax_metrics = fig.add_subplot(gs[0, 1])
+        self._plot_comparison_metrics_panel(
+            ax=ax_metrics,
+            errors_by_mode=errors_by_mode,
+            bev_errors_by_mode=bev_errors_by_mode,
+        )
+        
+        fig.suptitle(
+            'Ball Trajectory Analysis: All Modes Comparison',
+            fontsize=16, fontweight='bold', y=0.98, color='#212121'
+        )
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        
+        if output_path:
+            fig.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='#FAFAFA')
+            print(f"Saved overlay trajectory plot: {output_path}")
+        
+        return fig
+    
+    def _plot_lane_panel(
+        self,
+        ax: plt.Axes,
+        trajectory: List[Tuple[float, float]],
+        gt_trajectory: Optional[List[Tuple[float, float]]],
+        lane_boundary: np.ndarray,
+        color: str,
+    ) -> None:
+        """Plot lane with single trajectory."""
+        ax.set_facecolor('#F5F5F5')
+        
+        # Plot lane boundary (filled region)
+        if lane_boundary.size > 0:
+            lane_x = lane_boundary[:, 0]
+            lane_y = lane_boundary[:, 1]
+            ax.fill(lane_x, lane_y, color=self.COLORS['lane'], alpha=0.25, label='Lane')
+            ax.plot(lane_x, lane_y, color=self.COLORS['lane'], linewidth=2.5, 
+                   linestyle='-', alpha=0.8)
+        
+        # Note: GT trajectory not shown in BEV space because inverse calibration
+        # is only approximate. BEV errors are still computed and displayed in metrics.
+        
+        # Plot predicted trajectory with ball positions
+        if trajectory:
+            traj_arr = np.array(trajectory)
+            traj_x = traj_arr[:, 0]
+            traj_y = traj_arr[:, 1]
+            
+            # Trajectory line
+            ax.plot(traj_x, traj_y, color=color, linewidth=3, alpha=0.8, zorder=3, 
+                   label='Predicted')
+            
+            # Ball position markers
+            ax.scatter(traj_x, traj_y, s=80, c=color, edgecolor='white', 
+                      linewidth=1.5, alpha=0.9, zorder=4)
+            
+            # Start marker
+            ax.scatter(traj_x[0], traj_y[0], s=300, c='#4CAF50', edgecolor='white',
+                      linewidth=3, marker='o', label='Start', zorder=6)
+            
+            # End marker
+            ax.scatter(traj_x[-1], traj_y[-1], s=300, c='#F44336', edgecolor='white',
+                      linewidth=3, marker='s', label='End', zorder=6)
+            
+            # Direction arrows
+            n_arrows = min(5, len(traj_x) - 1)
+            if n_arrows > 0:
+                arrow_indices = np.linspace(0, len(traj_x) - 2, n_arrows, dtype=int)
+                for i in arrow_indices:
+                    dx = traj_x[i + 1] - traj_x[i]
+                    dy = traj_y[i + 1] - traj_y[i]
+                    ax.arrow(traj_x[i], traj_y[i], dx * 0.6, dy * 0.6,
+                            head_width=12, head_length=10, fc=color, ec=color,
+                            alpha=0.5, zorder=5)
+        
+        # Formatting
+        ax.set_xlabel('BEV X (pixels)', fontsize=12, fontweight='bold')
+        ax.set_ylabel('BEV Y (pixels)', fontsize=12, fontweight='bold')
+        ax.legend(loc='lower right', fontsize=10, framealpha=0.95)
+        ax.grid(True, alpha=0.3, color='#BDBDBD', linestyle='-', linewidth=0.5)
+        ax.set_aspect('equal', adjustable='box')
+        ax.invert_yaxis()
+    
+    def _plot_overlay_lane_panel(
+        self,
+        ax: plt.Axes,
+        trajectories: Dict[str, List[Tuple[float, float]]],
+        gt_trajectory: Optional[List[Tuple[float, float]]],
+        lane_boundary: np.ndarray,
+        mode_colors: Dict[str, str],
+    ) -> None:
+        """Plot lane with all trajectories overlaid."""
+        ax.set_facecolor('#F5F5F5')
+        
+        # Plot lane boundary
+        if lane_boundary.size > 0:
+            lane_x = lane_boundary[:, 0]
+            lane_y = lane_boundary[:, 1]
+            ax.fill(lane_x, lane_y, color=self.COLORS['lane'], alpha=0.2, label='Lane')
+            ax.plot(lane_x, lane_y, color=self.COLORS['lane'], linewidth=3, 
+                   linestyle='-', alpha=0.8)
+        
+        # Note: GT trajectory not shown in BEV space because inverse calibration
+        # is only approximate. BEV errors are still computed and displayed in metrics.
+        
+        modes = ['none', 'linear', 'cubic']
+        mode_labels = {'none': 'None', 'linear': 'Linear', 'cubic': 'Cubic'}
+        
+        # Plot each trajectory
+        for mode in modes:
+            traj = trajectories.get(mode, [])
+            if not traj:
+                continue
+            
+            traj_arr = np.array(traj)
+            color = mode_colors[mode]
+            
+            ax.plot(traj_arr[:, 0], traj_arr[:, 1], color=color, linewidth=2.5,
+                   alpha=0.8, label=f'{mode_labels[mode]}', zorder=3)
+            ax.scatter(traj_arr[:, 0], traj_arr[:, 1], s=50, c=color, 
+                      edgecolor='white', linewidth=1, alpha=0.7, zorder=4)
+        
+        # Shared start/end markers from first available trajectory
+        for mode in modes:
+            traj = trajectories.get(mode, [])
+            if traj:
+                traj_arr = np.array(traj)
+                ax.scatter(traj_arr[0, 0], traj_arr[0, 1], s=350, c='#4CAF50', 
+                          edgecolor='white', linewidth=3, marker='o', 
+                          label='Start', zorder=6)
+                ax.scatter(traj_arr[-1, 0], traj_arr[-1, 1], s=350, c='#F44336', 
+                          edgecolor='white', linewidth=3, marker='s', 
+                          label='End', zorder=6)
+                break
+        
+        # Formatting
+        ax.set_xlabel('BEV X (pixels)', fontsize=12, fontweight='bold')
+        ax.set_ylabel('BEV Y (pixels)', fontsize=12, fontweight='bold')
+        ax.legend(loc='lower right', fontsize=10, framealpha=0.95, ncol=2)
+        ax.grid(True, alpha=0.3, color='#BDBDBD', linestyle='-', linewidth=0.5)
+        ax.set_aspect('equal', adjustable='box')
+        ax.invert_yaxis()
+    
+    def _plot_metrics_panel(
+        self,
+        ax: plt.Axes,
+        mode: str,
+        errors: Dict[str, float],
+        bev_errors: Dict[str, float],
+    ) -> None:
+        """Plot metrics as a clean table panel."""
+        ax.set_facecolor('#FAFAFA')
+        ax.axis('off')
+        
+        mode_titles = {'none': 'NO INTERPOLATION', 'linear': 'LINEAR', 'cubic': 'CUBIC SPLINE'}
+        
+        # Build table data
+        table_data = []
+        row_colors = []
+        
+        # Header section
+        table_data.append(['WORLD METRICS', ''])
+        row_colors.append('#E3F2FD')
+        
+        if 'speed_error' in errors:
+            table_data.append(['Speed MAE', f"{abs(errors['speed_error']):.3f} m/s"])
+            row_colors.append('white')
+        if 'accel_mag_error' in errors:
+            table_data.append(['Accel MAE', f"{abs(errors['accel_mag_error']):.3f} m/s²"])
+            row_colors.append('white')
+        if 'total_break_error' in errors:
+            table_data.append(['Break Error', f"{abs(errors['total_break_error']):.4f} m"])
+            row_colors.append('white')
+        if 'end_speed_error' in errors:
+            table_data.append(['End Speed Err', f"{abs(errors['end_speed_error']):.3f} m/s"])
+            row_colors.append('white')
+        
+        # BEV section
+        table_data.append(['BEV ERRORS', ''])
+        row_colors.append('#E8F5E9')
+        
+        if 'bev_x_rmse' in bev_errors:
+            table_data.append(['X RMSE', f"{bev_errors['bev_x_rmse']:.2f} px"])
+            row_colors.append('white')
+        if 'bev_y_rmse' in bev_errors:
+            table_data.append(['Y RMSE', f"{bev_errors['bev_y_rmse']:.2f} px"])
+            row_colors.append('white')
+        if 'bev_total_rmse' in bev_errors:
+            table_data.append(['Total RMSE', f"{bev_errors['bev_total_rmse']:.2f} px"])
+            row_colors.append('white')
+        
+        # Detection quality
+        table_data.append(['DETECTION', ''])
+        row_colors.append('#FFF3E0')
+        
+        if 'seg_map_50_95' in errors:
+            table_data.append(['mAP@50-95', f"{errors['seg_map_50_95']:.1%}"])
+            row_colors.append('white')
+        
+        # Create table
+        table = ax.table(
+            cellText=table_data,
+            cellLoc='left',
+            loc='center',
+            cellColours=[[c, c] for c in row_colors],
+        )
+        
+        table.auto_set_font_size(False)
+        table.set_fontsize(11)
+        table.scale(1.0, 1.8)
+        
+        # Style header cells
+        for i, row in enumerate(table_data):
+            if row[1] == '':  # Section headers
+                table[(i, 0)].set_text_props(fontweight='bold', fontsize=12)
+                table[(i, 1)].set_text_props(fontweight='bold')
+        
+        # Add title
+        ax.set_title(f'{mode_titles.get(mode, mode.upper())}', 
+                    fontsize=14, fontweight='bold', pad=20, color='#212121')
+    
+    def _plot_comparison_metrics_panel(
+        self,
+        ax: plt.Axes,
+        errors_by_mode: Dict[str, Dict[str, float]],
+        bev_errors_by_mode: Dict[str, Dict[str, float]],
+    ) -> None:
+        """Plot comparison metrics table for all modes."""
+        ax.set_facecolor('#FAFAFA')
+        ax.axis('off')
+        
+        modes = ['none', 'linear', 'cubic']
+        
+        # Build comparison table
+        table_data = []
+        row_colors = []
+        
+        # Header row
+        table_data.append(['Metric', 'None', 'Linear', 'Cubic', 'Avg'])
+        row_colors.append('#E0E0E0')
+        
+        # Speed MAE
+        vals = [abs(errors_by_mode.get(m, {}).get('speed_error', 0)) for m in modes]
+        avg = np.mean(vals)
+        table_data.append(['Speed (m/s)', f'{vals[0]:.2f}', f'{vals[1]:.2f}', f'{vals[2]:.2f}', f'{avg:.2f}'])
+        row_colors.append('#E3F2FD')
+        
+        # Accel MAE
+        vals = [abs(errors_by_mode.get(m, {}).get('accel_mag_error', 0)) for m in modes]
+        avg = np.mean(vals)
+        table_data.append(['Accel (m/s²)', f'{vals[0]:.2f}', f'{vals[1]:.2f}', f'{vals[2]:.2f}', f'{avg:.2f}'])
+        row_colors.append('white')
+        
+        # Break Error
+        vals = [abs(errors_by_mode.get(m, {}).get('total_break_error', 0)) for m in modes]
+        avg = np.mean(vals)
+        table_data.append(['Break (m)', f'{vals[0]:.4f}', f'{vals[1]:.4f}', f'{vals[2]:.4f}', f'{avg:.4f}'])
+        row_colors.append('#E3F2FD')
+        
+        # End Speed
+        vals = [abs(errors_by_mode.get(m, {}).get('end_speed_error', 0)) for m in modes]
+        avg = np.mean(vals)
+        table_data.append(['End Spd (m/s)', f'{vals[0]:.2f}', f'{vals[1]:.2f}', f'{vals[2]:.2f}', f'{avg:.2f}'])
+        row_colors.append('white')
+        
+        # Separator
+        table_data.append(['', '', '', '', ''])
+        row_colors.append('#FAFAFA')
+        
+        # BEV X RMSE
+        vals = [bev_errors_by_mode.get(m, {}).get('bev_x_rmse', 0) for m in modes]
+        avg = np.mean(vals)
+        table_data.append(['BEV X (px)', f'{vals[0]:.2f}', f'{vals[1]:.2f}', f'{vals[2]:.2f}', f'{avg:.2f}'])
+        row_colors.append('#E8F5E9')
+        
+        # BEV Y RMSE
+        vals = [bev_errors_by_mode.get(m, {}).get('bev_y_rmse', 0) for m in modes]
+        avg = np.mean(vals)
+        table_data.append(['BEV Y (px)', f'{vals[0]:.2f}', f'{vals[1]:.2f}', f'{vals[2]:.2f}', f'{avg:.2f}'])
+        row_colors.append('white')
+        
+        # BEV Total RMSE
+        vals = [bev_errors_by_mode.get(m, {}).get('bev_total_rmse', 0) for m in modes]
+        avg = np.mean(vals)
+        table_data.append(['BEV Total (px)', f'{vals[0]:.2f}', f'{vals[1]:.2f}', f'{vals[2]:.2f}', f'{avg:.2f}'])
+        row_colors.append('#E8F5E9')
+        
+        # Separator
+        table_data.append(['', '', '', '', ''])
+        row_colors.append('#FAFAFA')
+        
+        # mAP
+        vals = [errors_by_mode.get(m, {}).get('seg_map_50_95', 0) for m in modes]
+        avg = np.mean(vals)
+        table_data.append(['mAP@50-95', f'{vals[0]:.1%}', f'{vals[1]:.1%}', f'{vals[2]:.1%}', f'{avg:.1%}'])
+        row_colors.append('#FFF3E0')
+        
+        # Create table
+        table = ax.table(
+            cellText=table_data,
+            cellLoc='center',
+            loc='center',
+            cellColours=[[c] * 5 for c in row_colors],
+        )
+        
+        table.auto_set_font_size(False)
+        table.set_fontsize(11)
+        table.scale(1.0, 1.6)
+        
+        # Style header row
+        for j in range(5):
+            table[(0, j)].set_text_props(fontweight='bold', fontsize=12)
+        
+        # Style first column
+        for i in range(len(table_data)):
+            table[(i, 0)].set_text_props(fontweight='bold')
+        
+        ax.set_title('Metrics Comparison', fontsize=14, fontweight='bold', pad=20, color='#212121')
+    
+    def _format_metrics_key(
+        self, 
+        mode: str, 
+        errors: Dict[str, float], 
+        bev_errors: Dict[str, float]
+    ) -> str:
+        """Format a compact metrics key for a single panel."""
+        lines = [f"═══ {mode.upper()} ═══"]
+        
+        # World/Lane metrics
+        if errors:
+            lines.append("World Metrics:")
+            if 'speed_error' in errors:
+                lines.append(f"  Speed MAE:  {abs(errors['speed_error']):6.2f} m/s")
+            if 'accel_mag_error' in errors:
+                lines.append(f"  Accel MAE:  {abs(errors['accel_mag_error']):6.2f} m/s²")
+            if 'total_break_error' in errors:
+                lines.append(f"  Break Err:  {abs(errors['total_break_error']):6.3f} m")
+            if 'end_speed_error' in errors:
+                lines.append(f"  End Spd:    {abs(errors['end_speed_error']):6.2f} m/s")
+        
+        # BEV coordinate errors
+        if bev_errors:
+            lines.append("BEV Errors:")
+            if 'bev_x_rmse' in bev_errors:
+                lines.append(f"  X RMSE:     {bev_errors['bev_x_rmse']:6.2f} px")
+            if 'bev_y_rmse' in bev_errors:
+                lines.append(f"  Y RMSE:     {bev_errors['bev_y_rmse']:6.2f} px")
+            if 'bev_total_rmse' in bev_errors:
+                lines.append(f"  Total RMSE: {bev_errors['bev_total_rmse']:6.2f} px")
+        
+        # Detection quality
+        if 'seg_map_50_95' in errors:
+            lines.append(f"mAP@50-95:    {errors['seg_map_50_95']:6.1%}")
         
         return '\n'.join(lines)
     
@@ -729,7 +1236,7 @@ class ErrorAnalysisPlotter:
                     color='#1976D2', markerfacecolor='#1976D2',
                     markeredgecolor='white', markeredgewidth=2)
         ax1.set_xlabel('Lane Fraction', fontsize=12, fontweight='bold')
-        ax1.set_ylabel('Speed Error (units/s)', fontsize=12, fontweight='bold')
+        ax1.set_ylabel('Speed Error (m/s)', fontsize=12, fontweight='bold')
         ax1.set_title('Average Speed Error Along Lane', fontsize=14, fontweight='bold', pad=15)
         ax1.grid(True, alpha=0.3, color='#BDBDBD', linestyle='-', linewidth=0.8)
 
@@ -742,7 +1249,7 @@ class ErrorAnalysisPlotter:
                     color='#F57C00', markerfacecolor='#F57C00',
                     markeredgecolor='white', markeredgewidth=2)
         ax2.set_xlabel('Lane Fraction', fontsize=12, fontweight='bold')
-        ax2.set_ylabel('Accel Error (units/s²)', fontsize=12, fontweight='bold')
+        ax2.set_ylabel('Accel Error (m/s²)', fontsize=12, fontweight='bold')
         ax2.set_title('Average Acceleration Error Along Lane', fontsize=14, fontweight='bold', pad=15)
         ax2.grid(True, alpha=0.3, color='#BDBDBD', linestyle='-', linewidth=0.8)
 
@@ -801,7 +1308,7 @@ class ErrorAnalysisPlotter:
 
         # Compute average across modes
         metric_keys = ['speed_error', 'accel_mag_error', 'total_break_error', 'end_speed_error']
-        metric_labels = ['Speed\n(units/s)', 'Acceleration\n(units/s²)', 'Break\n(units)', 'End Speed\n(units/s)']
+        metric_labels = ['Speed\n(m/s)', 'Acceleration\n(m/s²)', 'Break\n(m)', 'End Speed\n(m/s)']
         avg_values = []
 
         for key in metric_keys:

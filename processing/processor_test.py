@@ -88,11 +88,23 @@ def _make_dummy_frames(img_dir: Path, num_frames: int) -> None:
 
 
 def _extract_bev_axes(
-    results_by_index: Dict[int, ProcessResult]
-) -> Tuple[np.ndarray, np.ndarray, List[int]]:
+    results_by_index: Dict[int, ProcessResult],
+    lane_metrics: Optional[LaneMetrics] = None,
+) -> Tuple[np.ndarray, np.ndarray, List[int], int]:
     """
     Extract along-lane (s_bev) and lateral (l_bev) coordinates from BEV
     centroids, using the same primary-axis logic as PostProcessor.
+    
+    Returns
+    -------
+    s_bev : np.ndarray
+        Along-lane BEV coordinates
+    l_bev : np.ndarray
+        Lateral BEV coordinates
+    frames : List[int]
+        Frame indices
+    primary_axis : int
+        0 if X is primary, 1 if Y is primary
     """
     idxs = sorted(results_by_index.keys())
     traj: List[Tuple[float, float]] = []
@@ -108,29 +120,47 @@ def _extract_bev_axes(
     xs = bev[:, 0]
     ys = bev[:, 1]
 
-    # Choose primary axis as the one with larger dynamic range.
-    range_x = float(xs.max() - xs.min())
-    range_y = float(ys.max() - ys.min())
-    primary_axis = 0 if range_x >= range_y else 1
+    # Choose primary axis as the one with larger dynamic range
+    # Use lane_metrics if provided to match what PostProcessor computed
+    if lane_metrics is not None:
+        primary_axis = lane_metrics.primary_axis
+    else:
+        range_x = float(xs.max() - xs.min())
+        range_y = float(ys.max() - ys.min())
+        primary_axis = 0 if range_x >= range_y else 1
 
     s_bev = xs if primary_axis == 0 else ys  # along-lane coordinate
     l_bev = ys if primary_axis == 0 else xs  # lateral coordinate
 
-    return s_bev, l_bev, frames
+    return s_bev, l_bev, frames, primary_axis
 
 
 def _calibrate_bev_to_world(
     results_by_index: Dict[int, ProcessResult],
     gt_data: Dict[int, Dict[str, float]],
     episode_idx: int,
+    lane_metrics: Optional[LaneMetrics] = None,
 ) -> Tuple[float, float, float, float]:
     """
-    Compute linear mappings:
-      s_world ≈ a_s * s_bev + b_s
-      y_world ≈ a_l * l_bev + b_l
-    based on BEV centroids and ground-truth (lane_s, y) for one episode.
+    Compute linear mappings from BEV to world/lane coordinates:
+      lane_s ≈ a_s * s_bev + b_s
+      world_y ≈ a_l * l_bev + b_l
+    
+    The sign of a_s indicates whether BEV and world coordinates are aligned:
+    - a_s > 0: BEV s increases as lane_s increases (same direction)
+    - a_s < 0: BEV s decreases as lane_s increases (opposite direction)
+    
+    For velocity calibration, we use |a_s| since the PostProcessor normalizes
+    trajectories to always have positive along-lane velocity.
+    
+    Returns
+    -------
+    a_s, b_s : float
+        Scale and offset for along-lane coordinate
+    a_l, b_l : float
+        Scale and offset for lateral coordinate
     """
-    s_bev, l_bev, frames = _extract_bev_axes(results_by_index)
+    s_bev, l_bev, frames, primary_axis = _extract_bev_axes(results_by_index, lane_metrics)
 
     lane_s_world: List[float] = []
     y_world: List[float] = []
@@ -149,13 +179,28 @@ def _calibrate_bev_to_world(
     if len(lane_s_world) < 4:
         raise ValueError(f"Not enough GT points to calibrate episode {episode_idx}")
 
-    s_bev_used = np.array(s_bev_used, dtype=np.float64)
-    l_bev_used = np.array(l_bev_used, dtype=np.float64)
-    lane_s_world = np.array(lane_s_world, dtype=np.float64)
-    y_world = np.array(y_world, dtype=np.float64)
+    s_bev_arr = np.array(s_bev_used, dtype=np.float64)
+    l_bev_arr = np.array(l_bev_used, dtype=np.float64)
+    lane_s_arr = np.array(lane_s_world, dtype=np.float64)
+    y_world_arr = np.array(y_world, dtype=np.float64)
 
-    a_s, b_s = np.polyfit(s_bev_used, lane_s_world, deg=1)
-    a_l, b_l = np.polyfit(l_bev_used, y_world, deg=1)
+    # Fit linear calibration: lane_s = a_s * s_bev + b_s
+    a_s, b_s = np.polyfit(s_bev_arr, lane_s_arr, deg=1)
+    a_l, b_l = np.polyfit(l_bev_arr, y_world_arr, deg=1)
+    
+    # Validate calibration quality
+    residuals_s = lane_s_arr - (a_s * s_bev_arr + b_s)
+    residuals_l = y_world_arr - (a_l * l_bev_arr + b_l)
+    rmse_s = float(np.sqrt(np.mean(residuals_s**2)))
+    rmse_l = float(np.sqrt(np.mean(residuals_l**2)))
+    
+    # Warn if calibration is poor (arbitrary threshold, adjust as needed)
+    if rmse_s > 1.0:
+        import warnings
+        warnings.warn(f"High calibration RMSE for lane_s: {rmse_s:.4f}")
+    if rmse_l > 0.5:
+        import warnings
+        warnings.warn(f"High calibration RMSE for world_y: {rmse_l:.4f}")
 
     return float(a_s), float(b_s), float(a_l), float(b_l)
 
@@ -185,14 +230,16 @@ def _load_ground_truth_csv() -> Dict[int, Dict[str, float]]:
     return gt_data
 
 
-def _compute_lane_metrics_ground_truth(episode_idx: int, gt_data: Dict[int, Dict[str, float]],
-                                      fractions: Tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)) -> LaneMetrics:
+def _compute_lane_metrics_ground_truth(
+    episode_idx: int, 
+    gt_data: Dict[int, Dict[str, float]],
+    fractions: Tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
+) -> LaneMetrics:
     """
     Compute ground truth lane metrics for an episode.
     
-    BUG FIX #4: Use velocities directly from CSV (vx_units_per_sec, vy_units_per_sec)
-    instead of computing from world Y coordinate which is NOT lane-relative lateral.
-    The CSV provides pre-computed velocities that are more accurate.
+    IMPORTANT: Uses lane_s velocity (gradient of lane_s) to match predicted metrics
+    which are in lane coordinates, NOT world (x, y) coordinates.
     """
     # Get all frames for this episode
     episode_frames = {k: v for k, v in gt_data.items() if v["episode_idx"] == episode_idx}
@@ -200,25 +247,23 @@ def _compute_lane_metrics_ground_truth(episode_idx: int, gt_data: Dict[int, Dict
         raise ValueError(f"No frames found for episode {episode_idx}")
 
     frame_indices = sorted(episode_frames.keys())
-    lane_s_vals = [episode_frames[idx]["lane_s"] for idx in frame_indices]
+    lane_s_vals = np.array([episode_frames[idx]["lane_s"] for idx in frame_indices])
+    y_vals = np.array([episode_frames[idx]["y"] for idx in frame_indices])
     
-    # BUG FIX #4: Use pre-computed velocities from CSV instead of gradient of world coords
-    # The CSV has vx_units_per_sec and vy_units_per_sec which are properly computed
-    vs = np.array([episode_frames[idx]["vx"] for idx in frame_indices])  # velocity along lane (vx from CSV)
-    vl = np.array([episode_frames[idx]["vy"] for idx in frame_indices])  # lateral velocity (vy from CSV)
+    # Compute lane_s velocity (how fast ball moves ALONG the lane)
+    # This is what the predicted metrics measure, not world vx
+    dt = 1.0 / 30.0  # 30 FPS
+    vs_lane = np.gradient(lane_s_vals, dt)  # Lane arc length velocity (always positive)
+    vl = np.gradient(y_vals, dt)  # Lateral velocity (world Y direction)
     
-    # Keep y_vals for total_break calculation (lateral position)
-    y_vals = [episode_frames[idx]["y"] for idx in frame_indices]
+    # Compute accelerations
+    as_lane = np.gradient(vs_lane, dt)
+    al = np.gradient(vl, dt)
     
     # Find lane start/end
-    lane_start_s = min(lane_s_vals)
-    lane_end_s = max(lane_s_vals)
+    lane_start_s = float(lane_s_vals.min())
+    lane_end_s = float(lane_s_vals.max())
     lane_length = lane_end_s - lane_start_s
-
-    # Compute accelerations using finite differences on the provided velocities
-    dt = 1.0 / 30.0  # 30 FPS
-    as_ = np.gradient(vs, dt)          # acceleration along lane
-    al = np.gradient(vl, dt)           # lateral acceleration
 
     frac_positions = []
     vel_at_frac = []
@@ -226,27 +271,24 @@ def _compute_lane_metrics_ground_truth(episode_idx: int, gt_data: Dict[int, Dict
 
     for frac in fractions:
         target_s = lane_start_s + frac * lane_length
-        # Find closest frame
-        closest_idx = np.argmin(np.abs(np.array(lane_s_vals) - target_s))
-        idx = frame_indices[closest_idx]
+        closest_idx = np.argmin(np.abs(lane_s_vals - target_s))
 
-        vx = vs[closest_idx]
-        vy = vl[closest_idx]
-        speed = np.hypot(vx, vy)
+        vs_f = float(vs_lane[closest_idx])
+        vl_f = float(vl[closest_idx])
+        speed_f = float(np.hypot(vs_f, vl_f))
 
-        ax = as_[closest_idx]
-        ay = al[closest_idx]
-        accel_mag = np.hypot(ax, ay)
+        as_f = float(as_lane[closest_idx])
+        al_f = float(al[closest_idx])
+        accel_mag_f = float(np.hypot(as_f, al_f))
 
-        frac_positions.append(lane_s_vals[closest_idx])
-        vel_at_frac.append((vx, vy, speed))
-        acc_at_frac.append((ax, ay, accel_mag))
+        frac_positions.append(float(lane_s_vals[closest_idx]))
+        vel_at_frac.append((vs_f, vl_f, speed_f))
+        acc_at_frac.append((as_f, al_f, accel_mag_f))
 
-    # Total break and end speed
-    start_y = y_vals[0]
-    end_y = y_vals[-1]
-    total_break = abs(end_y - start_y)
-    end_speed = np.hypot(vs[-1], vl[-1])
+    # Total break: lateral deviation from start to end
+    total_break = float(abs(y_vals[-1] - y_vals[0]))
+    # End speed
+    end_speed = float(np.hypot(vs_lane[-1], vl[-1]))
 
     return LaneMetrics(
         fractions=fractions,
@@ -267,13 +309,11 @@ def _format_csv_value(value, precision: int = 6):
     if isinstance(value, (float, np.floating)):
         if np.isnan(value) or np.isinf(value):
             return ""
-        # Use scientific notation for very small or very large numbers
         if abs(value) < 1e-10 and value != 0:
             return f"{value:.2e}"
         elif abs(value) > 1e6:
             return f"{value:.2e}"
         else:
-            # Round to precision decimal places and remove trailing zeros
             formatted = f"{value:.{precision}f}".rstrip('0').rstrip('.')
             return float(formatted) if '.' in f"{value:.{precision}f}" else int(float(formatted))
     return value
@@ -311,7 +351,6 @@ def _log_processor_test_results(
         gt_vel = gt_metrics.velocity_at_frac[i]
         gt_acc = gt_metrics.acceleration_at_frac[i]
 
-        # Get seg_map for this fraction if provided
         seg_map = seg_map_per_fraction[i] if seg_map_per_fraction and i < len(seg_map_per_fraction) else None
 
         row = {
@@ -322,37 +361,36 @@ def _log_processor_test_results(
             "fraction": frac,
             "frac_position": predicted_metrics.frac_positions[i],
 
-            # Predicted velocities
-            "pred_vel_x": pred_vel[0],
-            "pred_vel_y": pred_vel[1],
+            # Predicted velocities (lane coordinates: along-lane, lateral)
+            "pred_vel_s": pred_vel[0],  # Renamed from pred_vel_x
+            "pred_vel_l": pred_vel[1],  # Renamed from pred_vel_y
             "pred_speed": pred_vel[2],
 
-            # Ground truth velocities
-            "gt_vel_x": gt_vel[0],
-            "gt_vel_y": gt_vel[1],
+            # Ground truth velocities (lane coordinates)
+            "gt_vel_s": gt_vel[0],
+            "gt_vel_l": gt_vel[1],
             "gt_speed": gt_vel[2],
 
             # Velocity errors
-            "vel_x_error": pred_vel[0] - gt_vel[0],
-            "vel_y_error": pred_vel[1] - gt_vel[1],
+            "vel_s_error": pred_vel[0] - gt_vel[0],
+            "vel_l_error": pred_vel[1] - gt_vel[1],
             "speed_error": pred_vel[2] - gt_vel[2],
 
             # Predicted accelerations
-            "pred_acc_x": pred_acc[0],
-            "pred_acc_y": pred_acc[1],
+            "pred_acc_s": pred_acc[0],
+            "pred_acc_l": pred_acc[1],
             "pred_accel_mag": pred_acc[2],
 
             # Ground truth accelerations
-            "gt_acc_x": gt_acc[0],
-            "gt_acc_y": gt_acc[1],
+            "gt_acc_s": gt_acc[0],
+            "gt_acc_l": gt_acc[1],
             "gt_accel_mag": gt_acc[2],
 
             # Acceleration errors
-            "acc_x_error": pred_acc[0] - gt_acc[0],
-            "acc_y_error": pred_acc[1] - gt_acc[1],
+            "acc_s_error": pred_acc[0] - gt_acc[0],
+            "acc_l_error": pred_acc[1] - gt_acc[1],
             "accel_mag_error": pred_acc[2] - gt_acc[2],
 
-            # Segmentation mAP for this fraction (closest frame)
             "segmentation_map_50_95": seg_map,
         }
         csv_writer.writerow(_format_row(row))
@@ -366,20 +404,15 @@ def _log_processor_test_results(
         "fraction": "episode_total",
         "frac_position": None,
 
-        # Total break
         "pred_total_break": predicted_metrics.total_break,
         "gt_total_break": gt_metrics.total_break,
         "total_break_error": predicted_metrics.total_break - gt_metrics.total_break,
 
-        # End speed
         "pred_end_speed": predicted_metrics.end_lane_speed,
         "gt_end_speed": gt_metrics.end_lane_speed,
         "end_speed_error": predicted_metrics.end_lane_speed - gt_metrics.end_lane_speed,
 
-        # Frame count
         "frame_count": len(frame_indices),
-
-        # Episode mean mAP
         "segmentation_map_50_95": episode_mean_seg_map,
     }
     csv_writer.writerow(_format_row(row))
@@ -392,12 +425,12 @@ def _create_results_csv():
 
     fieldnames = [
         "timestamp", "test_name", "interpolation_mode", "episode_idx", "fraction", "frac_position",
-        "pred_vel_x", "pred_vel_y", "pred_speed",
-        "gt_vel_x", "gt_vel_y", "gt_speed",
-        "vel_x_error", "vel_y_error", "speed_error",
-        "pred_acc_x", "pred_acc_y", "pred_accel_mag",
-        "gt_acc_x", "gt_acc_y", "gt_accel_mag",
-        "acc_x_error", "acc_y_error", "accel_mag_error",
+        "pred_vel_s", "pred_vel_l", "pred_speed",
+        "gt_vel_s", "gt_vel_l", "gt_speed",
+        "vel_s_error", "vel_l_error", "speed_error",
+        "pred_acc_s", "pred_acc_l", "pred_accel_mag",
+        "gt_acc_s", "gt_acc_l", "gt_accel_mag",
+        "acc_s_error", "acc_l_error", "accel_mag_error",
         "pred_total_break", "gt_total_break", "total_break_error",
         "pred_end_speed", "gt_end_speed", "end_speed_error",
         "frame_count", "segmentation_map_50_95"
@@ -407,7 +440,7 @@ def _create_results_csv():
     writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
     writer.writeheader()
 
-    return csv_path, writer, f  # Return file handle so it can be closed
+    return csv_path, writer, f
 
 
 def test_full_processor_wrapper_computes_lane_metrics(tmp_path):
@@ -428,25 +461,21 @@ def test_full_processor_wrapper_computes_lane_metrics(tmp_path):
     assert len(episode.results_by_index) == num_frames
 
     metrics = episode.lane_metrics
-    # Fractions default to 4 positions along the lane
     assert len(metrics.fractions) == 4
     assert len(metrics.velocity_at_frac) == 4
     assert len(metrics.acceleration_at_frac) == 4
-
-    # With the synthetic trajectory, we should have non-zero end speed
     assert metrics.end_lane_speed > 0.0
-    # And some lateral break over the run
     assert metrics.total_break > 0.0
 
     # Log results to CSV
     csv_path, csv_writer, csv_file = _create_results_csv()
     print(f"\nLogging test results to: {csv_path}")
 
-    # Create synthetic ground truth for comparison (since this is synthetic test)
+    # Create synthetic ground truth for comparison
     synthetic_gt = LaneMetrics(
         fractions=metrics.fractions,
         frac_positions=metrics.frac_positions,
-        velocity_at_frac=tuple((v[0]*0.9, v[1]*0.9, v[2]*0.9) for v in metrics.velocity_at_frac),  # Slightly different GT
+        velocity_at_frac=tuple((v[0]*0.9, v[1]*0.9, v[2]*0.9) for v in metrics.velocity_at_frac),
         acceleration_at_frac=tuple((a[0]*0.8, a[1]*0.8, a[2]*0.8) for a in metrics.acceleration_at_frac),
         total_break=metrics.total_break * 1.1,
         end_lane_speed=metrics.end_lane_speed * 0.95,
@@ -462,7 +491,7 @@ def test_full_processor_wrapper_computes_lane_metrics(tmp_path):
         interpolation_mode="none"
     )
 
-    csv_file.close()  # Close the CSV file
+    csv_file.close()
 
 
 def _parse_yolo_seg_file(label_path: Path) -> Dict[int, np.ndarray]:
@@ -532,7 +561,6 @@ def _map_50_95_for_episode(pred_masks: dict[int, dict[str, np.ndarray]]) -> dict
 
         for cls in ("lane", "ball"):
             iou = _mask_iou(masks[cls], gt_masks[cls])
-            # single-instance AP at each threshold is 1 if IoU>=thr else 0
             aps.append([1.0 if iou >= t else 0.0 for t in thresholds])
 
         maps[idx] = float(np.mean(aps))
@@ -550,10 +578,144 @@ def _frames_with_ball(results_by_index: Dict[int, ProcessResult]) -> Dict[int, P
     return out
 
 
+def _compute_bev_coordinate_errors(
+    results_by_index: Dict[int, ProcessResult],
+    gt_data: Dict[int, Dict[str, float]],
+    episode_idx: int,
+    a_s: float,
+    b_s: float,
+    a_l: float,
+    b_l: float,
+    primary_axis: int,
+) -> Dict[str, float]:
+    """
+    Compute BEV coordinate errors (RMSE) between predicted and ground truth positions.
+    
+    This transforms GT world coordinates to BEV using the inverse of the calibration,
+    then computes RMSE between predicted BEV centroids and transformed GT.
+    
+    Parameters
+    ----------
+    results_by_index : Dict[int, ProcessResult]
+        Processing results with BEV centroids
+    gt_data : Dict[int, Dict[str, float]]
+        Ground truth data from CSV
+    episode_idx : int
+        Episode to evaluate
+    a_s, b_s, a_l, b_l : float
+        Calibration parameters (world = a * bev + b)
+    primary_axis : int
+        0 if x is along-lane, 1 if y is along-lane
+        
+    Returns
+    -------
+    Dict[str, float]
+        BEV error metrics: bev_x_rmse, bev_y_rmse, bev_total_rmse
+    """
+    x_errors = []
+    y_errors = []
+    
+    for frame_idx, result in sorted(results_by_index.items()):
+        if result.bev_centroid is None:
+            continue
+        
+        gt_row = gt_data.get(frame_idx)
+        if gt_row is None or gt_row["episode_idx"] != episode_idx:
+            continue
+        
+        pred_x, pred_y = result.bev_centroid
+        
+        # Transform GT world coords to BEV using inverse calibration
+        # world = a * bev + b  =>  bev = (world - b) / a
+        gt_lane_s = gt_row["lane_s"]
+        gt_world_y = gt_row["y"]
+        
+        # Inverse transform
+        if abs(a_s) > 1e-9:
+            gt_s_bev = (gt_lane_s - b_s) / a_s
+        else:
+            gt_s_bev = 0.0
+            
+        if abs(a_l) > 1e-9:
+            gt_l_bev = (gt_world_y - b_l) / a_l
+        else:
+            gt_l_bev = 0.0
+        
+        # Map back to x, y based on primary axis
+        if primary_axis == 0:
+            gt_x_bev = gt_s_bev
+            gt_y_bev = gt_l_bev
+        else:
+            gt_x_bev = gt_l_bev
+            gt_y_bev = gt_s_bev
+        
+        x_errors.append(pred_x - gt_x_bev)
+        y_errors.append(pred_y - gt_y_bev)
+    
+    if not x_errors:
+        return {"bev_x_rmse": 0.0, "bev_y_rmse": 0.0, "bev_total_rmse": 0.0}
+    
+    x_rmse = float(np.sqrt(np.mean(np.array(x_errors) ** 2)))
+    y_rmse = float(np.sqrt(np.mean(np.array(y_errors) ** 2)))
+    total_rmse = float(np.sqrt(np.mean(np.array(x_errors) ** 2 + np.array(y_errors) ** 2)))
+    
+    return {
+        "bev_x_rmse": x_rmse,
+        "bev_y_rmse": y_rmse,
+        "bev_total_rmse": total_rmse,
+    }
+
+
+def _get_gt_trajectory_in_bev(
+    gt_data: Dict[int, Dict[str, float]],
+    episode_idx: int,
+    a_s: float,
+    b_s: float,
+    a_l: float,
+    b_l: float,
+    primary_axis: int,
+) -> List[Tuple[float, float]]:
+    """
+    Convert ground truth world positions to BEV coordinates.
+    
+    Returns
+    -------
+    List[Tuple[float, float]]
+        Ground truth trajectory in BEV (x, y) coordinates
+    """
+    trajectory = []
+    
+    episode_frames = {k: v for k, v in gt_data.items() if v["episode_idx"] == episode_idx}
+    
+    for frame_idx in sorted(episode_frames.keys()):
+        row = episode_frames[frame_idx]
+        
+        gt_lane_s = row["lane_s"]
+        gt_world_y = row["y"]
+        
+        # Inverse transform: bev = (world - b) / a
+        if abs(a_s) > 1e-9:
+            gt_s_bev = (gt_lane_s - b_s) / a_s
+        else:
+            gt_s_bev = 0.0
+            
+        if abs(a_l) > 1e-9:
+            gt_l_bev = (gt_world_y - b_l) / a_l
+        else:
+            gt_l_bev = 0.0
+        
+        # Map to x, y based on primary axis
+        if primary_axis == 0:
+            trajectory.append((gt_s_bev, gt_l_bev))
+        else:
+            trajectory.append((gt_l_bev, gt_s_bev))
+    
+    return trajectory
+
+
 def _episode_frame_ranges(gt_data: Dict[int, Dict[str, float]], labels_dir: Path) -> Dict[int, range]:
     """
-    Derive per-episode frame ranges from available label files, aligned to GT if counts match.
-    Handles warm-up offset where (start-1) exists but GT starts later.
+    Derive per-episode frame ranges from available label files.
     """
     frames_by_ep: Dict[int, List[int]] = defaultdict(list)
     for frame_idx, row in gt_data.items():
@@ -563,7 +725,6 @@ def _episode_frame_ranges(gt_data: Dict[int, Dict[str, float]], labels_dir: Path
     ranges: Dict[int, range] = {}
 
     if available_frames_sorted:
-        # Build contiguous runs from available frames.
         contiguous: List[range] = []
         start = prev = available_frames_sorted[0]
         for f in available_frames_sorted[1:]:
@@ -579,19 +740,16 @@ def _episode_frame_ranges(gt_data: Dict[int, Dict[str, float]], labels_dir: Path
                 ranges[ep] = seg
             return ranges
 
-    # Fallback: clamp GT min/max to available frames, allowing start-1 shift.
+    # Fallback
     available_set = set(available_frames_sorted)
     for ep, frames in frames_by_ep.items():
         f_min, f_max = min(frames), max(frames)
-
         if f_min not in available_set and (f_min - 1) in available_set:
             f_min = f_min - 1
-
         while f_min not in available_set and f_min <= f_max:
             f_min += 1
         while f_max not in available_set and f_max >= f_min:
             f_max -= 1
-
         ranges[ep] = range(f_min, f_max + 1)
 
     return ranges
@@ -612,7 +770,7 @@ class _DatasetBackedYOLO:
         labels_dir = self.data_dir / "labels"
 
         img_path = Path(source)
-        stem = img_path.stem  # e.g. "_0064"
+        stem = img_path.stem
 
         img = cv2.imread(str(images_dir / f"{stem}.jpg"), cv2.IMREAD_COLOR)
         assert img is not None, f"Failed to read image at {img_path}"
@@ -648,12 +806,114 @@ class _DatasetBackedYOLO:
         return [_Result(masks, boxes, (h, w))]
 
 
+def _calibrate_and_convert_metrics(
+    bev_metrics: LaneMetrics,
+    a_s: float,
+    a_l: float,
+) -> LaneMetrics:
+    """
+    Convert BEV metrics to world/lane coordinates using calibration factors.
+    
+    The calibration maps:
+    - BEV along-lane position → lane_s (world arc length)
+    - BEV lateral position → world_y
+    
+    Velocity and acceleration are scaled by the MAGNITUDE of the calibration
+    factors (|a_s|, |a_l|) because:
+    
+    1. The PostProcessor normalizes trajectories so that the along-lane 
+       coordinate 's' is always INCREASING (via reversal if needed)
+    2. This means vs_bev (along-lane velocity) is always POSITIVE in the 
+       normalized BEV frame
+    3. Ground truth lane_s velocity is also POSITIVE (ball moves forward)
+    4. Therefore we use |a_s| to preserve the positive sign relationship
+    
+    The sign of a_s from calibration indicates whether raw BEV coords were
+    aligned with world coords, but this is already handled by the trajectory
+    reversal in PostProcessor.
+    
+    Parameters
+    ----------
+    bev_metrics : LaneMetrics
+        Metrics computed in BEV space (with trajectory normalization applied)
+    a_s : float
+        Calibration slope for along-lane: lane_s = a_s * s_bev + b_s
+    a_l : float
+        Calibration slope for lateral: world_y = a_l * l_bev + b_l
+        
+    Returns
+    -------
+    LaneMetrics
+        Metrics converted to world/lane coordinates
+    """
+    import warnings
+    
+    # Use absolute value for scaling since PostProcessor normalizes trajectory
+    # direction (velocities are always positive in normalized BEV frame)
+    scale_s = abs(a_s)
+    scale_l = abs(a_l)
+    
+    # Defensive check: scale factors should be reasonable
+    if scale_s < 1e-6 or scale_s > 1e6:
+        warnings.warn(f"Unusual along-lane scale factor: {scale_s}")
+    if scale_l < 1e-6 or scale_l > 1e6:
+        warnings.warn(f"Unusual lateral scale factor: {scale_l}")
+    
+    world_frac_positions = []
+    world_vel_at_frac = []
+    world_acc_at_frac = []
+    
+    # Track if any velocities are unexpectedly negative
+    negative_velocity_count = 0
+    
+    for i in range(len(bev_metrics.fractions)):
+        # Position conversion
+        pos_world = bev_metrics.frac_positions[i] * scale_s
+        
+        # Velocity: scale by calibration factor
+        vs_bev, vl_bev, _ = bev_metrics.velocity_at_frac[i]
+        
+        # Defensive check: vs_bev should be positive after trajectory normalization
+        if vs_bev < 0:
+            negative_velocity_count += 1
+        
+        vs_world = vs_bev * scale_s  # Lane velocity
+        vl_world = vl_bev * scale_l  # Lateral velocity
+        speed_world = float(np.hypot(vs_world, vl_world))
+        
+        # Acceleration
+        as_bev, al_bev, _ = bev_metrics.acceleration_at_frac[i]
+        as_world = as_bev * scale_s
+        al_world = al_bev * scale_l
+        accel_world = float(np.hypot(as_world, al_world))
+        
+        world_frac_positions.append(pos_world)
+        world_vel_at_frac.append((vs_world, vl_world, speed_world))
+        world_acc_at_frac.append((as_world, al_world, accel_world))
+    
+    # Warn if velocities are negative (shouldn't happen after PostProcessor normalization)
+    if negative_velocity_count > 0:
+        warnings.warn(
+            f"{negative_velocity_count}/{len(bev_metrics.fractions)} BEV velocities are negative. "
+            f"This suggests a bug in trajectory normalization."
+        )
+    
+    return LaneMetrics(
+        fractions=bev_metrics.fractions,
+        frac_positions=tuple(world_frac_positions),
+        velocity_at_frac=tuple(world_vel_at_frac),
+        acceleration_at_frac=tuple(world_acc_at_frac),
+        total_break=bev_metrics.total_break * scale_l,
+        end_lane_speed=bev_metrics.end_lane_speed * scale_s,
+        primary_axis=bev_metrics.primary_axis,
+        trajectory_reversed=bev_metrics.trajectory_reversed,
+    )
+
+
 def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
     """
     End-to-end processor test on the real curved_test_data_v1 images/labels
-    for episodes 1 and 2 (second and third episodes).
-    Comprehensive logging of predicted vs ground truth metrics.
-    Tests all three interpolation modes: none, linear, cubic.
+    for episodes 1 and 2. Tests all three interpolation modes.
     """
     data_dir = _test_data_dir()
     images_dir = data_dir / "images"
@@ -672,16 +932,14 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
     csv_path, csv_writer, csv_file = _create_results_csv()
     print(f"\nLogging comprehensive test results to: {csv_path}")
 
-    # Derive episode frame ranges dynamically from GT/logged labels (handles off-by-one)
     ep_ranges = _episode_frame_ranges(gt_data, labels_dir)
 
-    # Test with all interpolation modes
     interpolation_modes = ["none", "linear", "cubic"]
     
     all_errors_by_mode = {
         mode: {
-            "vel_x_errors": [], "vel_y_errors": [], "speed_errors": [],
-            "acc_x_errors": [], "acc_y_errors": [], "accel_mag_errors": [],
+            "vel_s_errors": [], "vel_l_errors": [], "speed_errors": [],
+            "acc_s_errors": [], "acc_l_errors": [], "accel_mag_errors": [],
             "total_break_errors": [], "end_speed_errors": []
         }
         for mode in interpolation_modes
@@ -692,9 +950,13 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
         print(f"Testing with interpolation mode: {interp_mode.upper()}")
         print(f"{'='*60}")
         
-        # Create processor with specific interpolation mode
         pre = YOLOSegPreprocessor(config=infer_cfg)
-        post = PostProcessor(out_size=(400, 800), dt=1.0 / 30.0, buffer_len=128, interpolation_mode=interp_mode)
+        post = PostProcessor(
+            out_size=(400, 800), 
+            dt=1.0 / 30.0, 
+            buffer_len=128, 
+            interpolation_mode=interp_mode
+        )
         proc = Processor(preprocessor=pre, postprocessor=post)
         
         all_errors = all_errors_by_mode[interp_mode]
@@ -709,7 +971,7 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
             first_frame_stem = f"_{frame_indices.start:04d}"
             src_pts, dst_pts = _homography_from_gt_lane(first_frame_stem, post.out_size)
             
-            # Run full processor (pre + post) end-to-end with fixed homography
+            # Run full processor
             episode = proc.run_episode_from_indices(
                 images_dir, frame_indices, homography_src_dst=(src_pts, dst_pts)
             )
@@ -718,80 +980,38 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
             assert episode.homography.shape == (3, 3)
             assert set(episode.results_by_index.keys()) == set(frame_indices)
 
-            # Compute per-frame mAP using raw masks (before warping)
+            # Compute per-frame mAP
             map_by_frame = _map_50_95_for_episode(episode.raw_masks_by_index)
 
-            # Only use frames with ball detections for calibration/metrics to avoid NaNs
+            # Filter to frames with ball detections
             results_with_ball = _frames_with_ball(episode.results_by_index)
             if len(results_with_ball) < 2:
-                raise AssertionError("Not enough frames with ball detections for metrics")
+                raise AssertionError("Not enough frames with ball detections")
 
             bev_metrics = episode.lane_metrics
             assert len(bev_metrics.fractions) == 4
-            assert len(bev_metrics.velocity_at_frac) == 4
-            assert len(bev_metrics.acceleration_at_frac) == 4
-            # Make assertions more conservative - just check they're non-negative
             assert bev_metrics.end_lane_speed >= 0.0
             assert bev_metrics.total_break >= 0.0
 
-            # Calibrate BEV coordinates to world coordinates using per-frame GT
-            # _calibrate_bev_to_world already drops frames with bev_centroid is None
+            # Calibrate BEV to world coordinates
             a_s, b_s, a_l, b_l = _calibrate_bev_to_world(
-                results_with_ball, gt_data, episode_idx
+                results_with_ball, gt_data, episode_idx, bev_metrics
             )
 
-            # Build world-space LaneMetrics from BEV metrics
-            # Also find closest frame for each fraction to get seg_map
-            world_fractions = bev_metrics.fractions
-            world_frac_positions: List[float] = []
-            world_vel_at_frac: List[Tuple[float, float, float]] = []
-            world_acc_at_frac: List[Tuple[float, float, float]] = []
-            seg_map_per_fraction: List[float] = []
+            # Convert BEV metrics to world/lane coordinates
+            pred_world_metrics = _calibrate_and_convert_metrics(bev_metrics, a_s, a_l)
 
-            # Extract BEV trajectory to find closest frames for fractions
-            s_bev, l_bev, frames_with_ball = _extract_bev_axes(results_with_ball)
-            
-            # BUG FIX #2: Apply sign correction based on s_axis_flipped flag
-            # If the s-axis was flipped in compute_lane_metrics, velocities have
-            # the opposite sign from what calibration expects
-            sign_correction = -1.0 if bev_metrics.s_axis_flipped else 1.0
-            
-            for i, frac in enumerate(world_fractions):
-                s_bev_target = bev_metrics.frac_positions[i]
-                s_world = a_s * s_bev_target + b_s
+            # Get seg_map per fraction
+            s_bev, _, frames_list, _ = _extract_bev_axes(results_with_ball, bev_metrics)
+            seg_map_per_fraction = []
+            for i in range(len(pred_world_metrics.fractions)):
+                s_target = bev_metrics.frac_positions[i]
+                idx_closest = int(np.argmin(np.abs(s_bev - s_target)))
+                frame_for_frac = frames_list[idx_closest]
+                seg_map = map_by_frame.get(frame_for_frac, 0.0)
+                seg_map_per_fraction.append(seg_map)
 
-                vx_bev, vy_bev, _ = bev_metrics.velocity_at_frac[i]
-                ax_bev, ay_bev, _ = bev_metrics.acceleration_at_frac[i]
-
-                # Apply sign correction to align with calibration coordinate system
-                vx_world = a_s * vx_bev * sign_correction
-                vy_world = a_l * vy_bev
-                speed_world = float(np.hypot(vx_world, vy_world))
-
-                ax_world = a_s * ax_bev * sign_correction
-                ay_world = a_l * ay_bev
-                accel_world = float(np.hypot(ax_world, ay_world))
-
-                world_frac_positions.append(s_world)
-                world_vel_at_frac.append((vx_world, vy_world, speed_world))
-                world_acc_at_frac.append((ax_world, ay_world, accel_world))
-
-                # Find closest frame index for this fraction
-                idx_closest = int(np.argmin(np.abs(s_bev - s_bev_target)))
-                frame_idx_for_frac = frames_with_ball[idx_closest]
-                seg_map = map_by_frame.get(frame_idx_for_frac)
-                seg_map_per_fraction.append(seg_map if seg_map is not None else 0.0)
-
-            pred_world_metrics = LaneMetrics(
-                fractions=tuple(world_fractions),
-                frac_positions=tuple(world_frac_positions),
-                velocity_at_frac=tuple(world_vel_at_frac),
-                acceleration_at_frac=tuple(world_acc_at_frac),
-                total_break=a_l * bev_metrics.total_break,
-                end_lane_speed=world_vel_at_frac[-1][2],
-            )
-
-            # Compute ground truth metrics for this episode (world space)
+            # Compute ground truth metrics (in lane coordinates)
             gt_metrics = _compute_lane_metrics_ground_truth(episode_idx, gt_data)
 
             # Compute episode mean mAP
@@ -810,18 +1030,18 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
                 episode_mean_seg_map=episode_mean_seg_map,
             )
 
-            # Collect errors for averaging
+            # Collect errors
             for i in range(len(pred_world_metrics.fractions)):
                 pred_vel = pred_world_metrics.velocity_at_frac[i]
                 pred_acc = pred_world_metrics.acceleration_at_frac[i]
                 gt_vel = gt_metrics.velocity_at_frac[i]
                 gt_acc = gt_metrics.acceleration_at_frac[i]
 
-                all_errors["vel_x_errors"].append(pred_vel[0] - gt_vel[0])
-                all_errors["vel_y_errors"].append(pred_vel[1] - gt_vel[1])
+                all_errors["vel_s_errors"].append(pred_vel[0] - gt_vel[0])
+                all_errors["vel_l_errors"].append(pred_vel[1] - gt_vel[1])
                 all_errors["speed_errors"].append(pred_vel[2] - gt_vel[2])
-                all_errors["acc_x_errors"].append(pred_acc[0] - gt_acc[0])
-                all_errors["acc_y_errors"].append(pred_acc[1] - gt_acc[1])
+                all_errors["acc_s_errors"].append(pred_acc[0] - gt_acc[0])
+                all_errors["acc_l_errors"].append(pred_acc[1] - gt_acc[1])
                 all_errors["accel_mag_errors"].append(pred_acc[2] - gt_acc[2])
 
             all_errors["total_break_errors"].append(
@@ -831,7 +1051,7 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
                 pred_world_metrics.end_lane_speed - gt_metrics.end_lane_speed
             )
 
-    # Log summary statistics for each interpolation mode
+    # Log summary statistics
     print(f"\n{'='*60}")
     print("SUMMARY STATISTICS BY INTERPOLATION MODE")
     print(f"{'='*60}")
@@ -839,7 +1059,6 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
     for interp_mode in interpolation_modes:
         all_errors = all_errors_by_mode[interp_mode]
         
-        # Log summary statistics as multiple rows (since CSV has limited columns)
         summary_base = {
             "timestamp": datetime.utcnow().isoformat(),
             "test_name": "summary_statistics",
@@ -847,18 +1066,17 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
             "episode_idx": None,
             "fraction": "averages",
             "frac_position": None,
-            "pred_vel_x": np.mean(all_errors["vel_x_errors"]),
-            "pred_vel_y": np.mean(all_errors["vel_y_errors"]),
+            "pred_vel_s": np.mean(all_errors["vel_s_errors"]),
+            "pred_vel_l": np.mean(all_errors["vel_l_errors"]),
             "pred_speed": np.mean(all_errors["speed_errors"]),
-            "pred_acc_x": np.mean(all_errors["acc_x_errors"]),
-            "pred_acc_y": np.mean(all_errors["acc_y_errors"]),
+            "pred_acc_s": np.mean(all_errors["acc_s_errors"]),
+            "pred_acc_l": np.mean(all_errors["acc_l_errors"]),
             "pred_accel_mag": np.mean(all_errors["accel_mag_errors"]),
             "pred_total_break": np.mean(all_errors["total_break_errors"]),
             "pred_end_speed": np.mean(all_errors["end_speed_errors"]),
         }
         csv_writer.writerow(_format_row(summary_base))
 
-        # Log MAE statistics
         mae_row = {
             "timestamp": datetime.utcnow().isoformat(),
             "test_name": "summary_statistics",
@@ -866,11 +1084,11 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
             "episode_idx": None,
             "fraction": "mae",
             "frac_position": None,
-            "pred_vel_x": np.mean(np.abs(all_errors["vel_x_errors"])),
-            "pred_vel_y": np.mean(np.abs(all_errors["vel_y_errors"])),
+            "pred_vel_s": np.mean(np.abs(all_errors["vel_s_errors"])),
+            "pred_vel_l": np.mean(np.abs(all_errors["vel_l_errors"])),
             "pred_speed": np.mean(np.abs(all_errors["speed_errors"])),
-            "pred_acc_x": np.mean(np.abs(all_errors["acc_x_errors"])),
-            "pred_acc_y": np.mean(np.abs(all_errors["acc_y_errors"])),
+            "pred_acc_s": np.mean(np.abs(all_errors["acc_s_errors"])),
+            "pred_acc_l": np.mean(np.abs(all_errors["acc_l_errors"])),
             "pred_accel_mag": np.mean(np.abs(all_errors["accel_mag_errors"])),
             "pred_total_break": np.mean(np.abs(all_errors["total_break_errors"])),
             "pred_end_speed": np.mean(np.abs(all_errors["end_speed_errors"])),
@@ -878,10 +1096,12 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
         csv_writer.writerow(_format_row(mae_row))
 
         print(f"\n{interp_mode.upper()} Interpolation:")
-        print(f"  Velocity MAE: {mae_row['pred_speed']:.4f} units/sec")
-        print(f"  Acceleration MAE: {mae_row['pred_accel_mag']:.4f} units/sec²")
-        print(f"  Total break MAE: {mae_row['pred_total_break']:.4f} units")
-        print(f"  End speed MAE: {mae_row['pred_end_speed']:.4f} units/sec")
+        print(f"  Lane Velocity MAE: {mae_row['pred_vel_s']:.4f} m/s")
+        print(f"  Lateral Velocity MAE: {mae_row['pred_vel_l']:.4f} m/s")
+        print(f"  Speed MAE: {mae_row['pred_speed']:.4f} m/s")
+        print(f"  Acceleration MAE: {mae_row['pred_accel_mag']:.4f} m/s²")
+        print(f"  Total break MAE: {mae_row['pred_total_break']:.4f} m")
+        print(f"  End speed MAE: {mae_row['pred_end_speed']:.4f} m/s")
 
     print(f"\n{'='*60}")
     print(f"Episodes tested: 2 (episodes 1 & 2)")
@@ -890,36 +1110,49 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
     print(f"Results saved to: {csv_path}")
     print(f"{'='*60}")
 
-    csv_file.close()  # Close the CSV file
+    csv_file.close()
     
     # ===================================================================
-    # VISUALIZATION: Generate trajectory plots and error analysis graphs
+    # VISUALIZATION
     # ===================================================================
     print(f"\n{'='*60}")
     print("GENERATING VISUALIZATION ARTIFACTS")
     print(f"{'='*60}")
     
-    # Import visualization module
+    import shutil
     from processing.postprocessing.visualizer import TrajectoryVisualizer, ErrorAnalysisPlotter
     
-    # Create output directory for visualizations
     viz_output_dir = _project_root() / "processing" / "visualization_output"
-    viz_output_dir.mkdir(exist_ok=True)
     
-    # Re-run processors to collect trajectory data for visualization
-    # (We need to store trajectories and lane boundaries from each mode)
+    # Clean up existing visualization output to avoid permission issues
+    if viz_output_dir.exists():
+        try:
+            shutil.rmtree(viz_output_dir)
+            print(f"Cleaned up existing visualization output directory")
+        except Exception as e:
+            print(f"Warning: Could not clean up {viz_output_dir}: {e}")
+    
+    viz_output_dir.mkdir(parents=True, exist_ok=True)
+    
     trajectories_by_mode = {}
     lane_boundary = None
     errors_by_mode = {}
+    bev_errors_by_mode = {}
+    gt_trajectory_bev = None
+    calibration_params = {}
     
     for interp_mode in interpolation_modes:
         print(f"\nCollecting trajectory data for {interp_mode} mode...")
         
         pre = YOLOSegPreprocessor(config=infer_cfg)
-        post = PostProcessor(out_size=(400, 800), dt=1.0 / 30.0, buffer_len=128, interpolation_mode=interp_mode)
+        post = PostProcessor(
+            out_size=(400, 800), 
+            dt=1.0 / 30.0, 
+            buffer_len=128, 
+            interpolation_mode=interp_mode
+        )
         proc = Processor(preprocessor=pre, postprocessor=post)
         
-        # Use episode 1 for visualization (it's representative)
         episode_idx = 1
         frame_indices = ep_ranges[episode_idx]
         
@@ -930,69 +1163,46 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
             images_dir, frame_indices, homography_src_dst=(src_pts, dst_pts)
         )
         
-        # Extract trajectory
         viz = TrajectoryVisualizer(bev_size=post.out_size)
-        trajectory = viz.extract_trajectory_from_results(episode.results_by_index)
+        # Extract trajectory WITH interpolation to match what metrics used
+        trajectory = viz.extract_trajectory_from_results(
+            episode.results_by_index,
+            apply_interpolation=(interp_mode != "none"),
+            interpolation_mode=interp_mode,
+            dt=post.dt
+        )
         trajectories_by_mode[interp_mode] = trajectory
         
-        # Extract lane boundary (only once, it's the same for all modes)
         if lane_boundary is None and episode.results_by_index:
             first_result = episode.results_by_index[frame_indices.start]
             lane_boundary = viz.extract_lane_boundary(first_result.warped_lane)
         
-        # Extract representative errors for overlay
+        # Compute errors for display
         results_with_ball = _frames_with_ball(episode.results_by_index)
         a_s, b_s, a_l, b_l = _calibrate_bev_to_world(
-            results_with_ball, gt_data, episode_idx
+            results_with_ball, gt_data, episode_idx, episode.lane_metrics
         )
         
-        bev_metrics = episode.lane_metrics
-        world_vel_at_frac: List[Tuple[float, float, float]] = []
-        world_acc_at_frac: List[Tuple[float, float, float]] = []
+        # Store calibration params for GT trajectory conversion
+        if interp_mode == "none":
+            calibration_params = {
+                'a_s': a_s, 'b_s': b_s, 'a_l': a_l, 'b_l': b_l,
+                'primary_axis': episode.lane_metrics.primary_axis
+            }
         
-        # Apply sign correction based on s_axis_flipped flag
-        sign_correction = -1.0 if bev_metrics.s_axis_flipped else 1.0
-        
-        for i, frac in enumerate(bev_metrics.fractions):
-            vx_bev, vy_bev, _ = bev_metrics.velocity_at_frac[i]
-            ax_bev, ay_bev, _ = bev_metrics.acceleration_at_frac[i]
-            
-            vx_world = a_s * vx_bev * sign_correction
-            vy_world = a_l * vy_bev
-            speed_world = float(np.hypot(vx_world, vy_world))
-            
-            ax_world = a_s * ax_bev * sign_correction
-            ay_world = a_l * ay_bev
-            accel_world = float(np.hypot(ax_world, ay_world))
-            
-            world_vel_at_frac.append((vx_world, vy_world, speed_world))
-            world_acc_at_frac.append((ax_world, ay_world, accel_world))
-        
-        pred_world_metrics = LaneMetrics(
-            fractions=tuple(bev_metrics.fractions),
-            frac_positions=tuple([a_s * p + b_s for p in bev_metrics.frac_positions]),
-            velocity_at_frac=tuple(world_vel_at_frac),
-            acceleration_at_frac=tuple(world_acc_at_frac),
-            total_break=a_l * bev_metrics.total_break,
-            end_lane_speed=world_vel_at_frac[-1][2],
-        )
-        
+        pred_world_metrics = _calibrate_and_convert_metrics(episode.lane_metrics, a_s, a_l)
         gt_metrics = _compute_lane_metrics_ground_truth(episode_idx, gt_data)
         
-        # Compute average errors across all fractions for display
         map_by_frame = _map_50_95_for_episode(episode.raw_masks_by_index)
         episode_mean_seg_map = float(np.nanmean(list(map_by_frame.values()))) if map_by_frame else 0.0
         
+        # Compute world/lane coordinate errors
         avg_errors = {
-            'vel_x_error': np.mean([pred_world_metrics.velocity_at_frac[i][0] - gt_metrics.velocity_at_frac[i][0] 
+            'vel_s_error': np.mean([pred_world_metrics.velocity_at_frac[i][0] - gt_metrics.velocity_at_frac[i][0] 
                                    for i in range(len(gt_metrics.fractions))]),
-            'vel_y_error': np.mean([pred_world_metrics.velocity_at_frac[i][1] - gt_metrics.velocity_at_frac[i][1] 
+            'vel_l_error': np.mean([pred_world_metrics.velocity_at_frac[i][1] - gt_metrics.velocity_at_frac[i][1] 
                                    for i in range(len(gt_metrics.fractions))]),
             'speed_error': np.mean([pred_world_metrics.velocity_at_frac[i][2] - gt_metrics.velocity_at_frac[i][2] 
-                                   for i in range(len(gt_metrics.fractions))]),
-            'acc_x_error': np.mean([pred_world_metrics.acceleration_at_frac[i][0] - gt_metrics.acceleration_at_frac[i][0] 
-                                   for i in range(len(gt_metrics.fractions))]),
-            'acc_y_error': np.mean([pred_world_metrics.acceleration_at_frac[i][1] - gt_metrics.acceleration_at_frac[i][1] 
                                    for i in range(len(gt_metrics.fractions))]),
             'accel_mag_error': np.mean([pred_world_metrics.acceleration_at_frac[i][2] - gt_metrics.acceleration_at_frac[i][2] 
                                        for i in range(len(gt_metrics.fractions))]),
@@ -1000,24 +1210,56 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
             'end_speed_error': pred_world_metrics.end_lane_speed - gt_metrics.end_lane_speed,
             'seg_map_50_95': episode_mean_seg_map,
         }
-        
         errors_by_mode[interp_mode] = avg_errors
+        
+        # Compute BEV coordinate errors
+        bev_errors = _compute_bev_coordinate_errors(
+            results_with_ball, gt_data, episode_idx,
+            a_s, b_s, a_l, b_l, episode.lane_metrics.primary_axis
+        )
+        bev_errors_by_mode[interp_mode] = bev_errors
+        
+        print(f"  BEV RMSE: X={bev_errors['bev_x_rmse']:.2f}px, Y={bev_errors['bev_y_rmse']:.2f}px, Total={bev_errors['bev_total_rmse']:.2f}px")
     
-    # Generate averaged trajectory plot (main visualization)
-    print("\nGenerating averaged trajectory plot...")
-    averaged_path = viz_output_dir / "trajectory_averaged.png"
-    viz.plot_averaged_trajectory(
+    # Get ground truth trajectory in BEV coordinates for overlay
+    if calibration_params:
+        gt_trajectory_bev = _get_gt_trajectory_in_bev(
+            gt_data, episode_idx,
+            calibration_params['a_s'], calibration_params['b_s'],
+            calibration_params['a_l'], calibration_params['b_l'],
+            calibration_params['primary_axis']
+        )
+    
+    # Generate individual trajectory plots for each mode
+    print("\nGenerating individual trajectory plots...")
+    for mode in interpolation_modes:
+        mode_path = viz_output_dir / f"trajectory_{mode}.png"
+        viz.plot_single_mode_trajectory(
+            trajectory=trajectories_by_mode.get(mode, []),
+            gt_trajectory=gt_trajectory_bev,
+            lane_boundary=lane_boundary,
+            mode=mode,
+            errors=errors_by_mode.get(mode, {}),
+            bev_errors=bev_errors_by_mode.get(mode, {}),
+            output_path=mode_path,
+        )
+        plt.close()
+    
+    # Generate overlay plot with all modes and comparison table
+    print("Generating overlay trajectory plot with comparison table...")
+    overlay_path = viz_output_dir / "trajectory_overlay.png"
+    viz.plot_overlay_trajectory(
         trajectories=trajectories_by_mode,
+        gt_trajectory=gt_trajectory_bev,
         lane_boundary=lane_boundary,
-        errors=errors_by_mode,
-        output_path=averaged_path,
+        errors_by_mode=errors_by_mode,
+        bev_errors_by_mode=bev_errors_by_mode,
+        output_path=overlay_path,
     )
-    plt.close()  # Close to free memory
+    plt.close()
     
-    # Generate error analysis plots from CSV
     print("Generating error analysis plots...")
     
-    # Parse CSV data
     csv_data = []
     with open(csv_path, 'r', newline='', encoding='utf-8') as f:
         reader = csv.DictReader(f)
@@ -1026,12 +1268,10 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
     
     error_plot = ErrorAnalysisPlotter()
     
-    # Detailed error analysis
     error_analysis_path = viz_output_dir / "error_analysis.png"
     error_plot.plot_error_comparison(csv_data, output_path=error_analysis_path)
     plt.close()
     
-    # Summary metrics
     summary_metrics_path = viz_output_dir / "summary_metrics.png"
     error_plot.plot_summary_metrics(csv_data, output_path=summary_metrics_path)
     plt.close()
@@ -1041,8 +1281,10 @@ def test_processor_on_curved_dataset_episodes_1_and_2_with_dataset_masks():
     print(f"{'='*60}")
     print(f"Output directory: {viz_output_dir}")
     print("\nGenerated files:")
-    print(f"  1. trajectory_averaged.png  - Clean averaged ball trajectory on lane")
-    print(f"  2. error_analysis.png       - Speed & acceleration error analysis")
-    print(f"  3. summary_metrics.png      - Performance metrics summary")
-    print(f"\nVisualization shows averaged results across all interpolation modes.")
+    print(f"  1. trajectory_none.png      - No interpolation mode (lane + metrics)")
+    print(f"  2. trajectory_linear.png    - Linear interpolation mode (lane + metrics)")
+    print(f"  3. trajectory_cubic.png     - Cubic spline mode (lane + metrics)")
+    print(f"  4. trajectory_overlay.png   - All modes overlaid with comparison table")
+    print(f"  5. error_analysis.png       - Speed & acceleration error analysis")
+    print(f"  6. summary_metrics.png      - Performance metrics summary")
     print(f"{'='*60}\n")
