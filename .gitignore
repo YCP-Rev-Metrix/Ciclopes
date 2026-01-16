@@ -25,3 +25,4 @@ OPTIMIZATION_SUMMARY.md
 /data
 *.pyc
 /processing/visualization_output
+/Ciclopes-API/video_folder
