@@ -6,7 +6,7 @@ from typing import Any, Dict
 import matplotlib.pyplot as plt
 from src.core.trainer_base import BaseTrainer
 from src.core.registry import register
-
+from ultralytics import YOLO
 
 @register("trainer", "yolo_seg")
 class YOLOSegTrainer(BaseTrainer):
@@ -21,8 +21,6 @@ class YOLOSegTrainer(BaseTrainer):
 
     def __init__(self, cfg, **components):
         super().__init__(cfg, **components)
-
-        from ultralytics import YOLO  # imported lazily for faster registry init
 
         self.mode = self._resolve_mode(cfg)
         self.assets_dir = Path(__file__).with_name("yolo_seg_configs")
