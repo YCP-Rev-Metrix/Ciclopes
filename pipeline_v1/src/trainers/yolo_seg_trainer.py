@@ -10,13 +10,6 @@ from ultralytics import YOLO
 
 @register("trainer", "yolo_seg")
 class YOLOSegTrainer(BaseTrainer):
-    """Self-sufficient YOLO segmentation trainer.
-
-    All runtime configuration (batch size, epochs, hyperparameters, etc.) is managed
-    via YAML files colocated with this trainer. Hydra is used only to select the
-    trainer and to provide run directories/seed management.
-    """
-
     required_components: list[str] = []
 
     def __init__(self, cfg, **components):
@@ -26,7 +19,6 @@ class YOLOSegTrainer(BaseTrainer):
         self.assets_dir = Path(__file__).with_name("yolo_seg_configs")
         self.config = self._load_local_config(self.mode)
 
-        # YOLO model weights (ultralytics downloads automatically if needed)
         model_ref = str(self.config.get("model", "yolo11s-seg.pt"))
         self._model = YOLO(model_ref)
 

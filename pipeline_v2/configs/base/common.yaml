@@ -1,0 +1,31 @@
+run:
+  name: null
+  seed: 42
+  mode: null
+
+model:
+  name: null
+
+data:
+  name: null
+  path: null
+  workers: 8
+
+training:
+  batch_size: 16
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  momentum: 0.9
+  optimizer: "adam"
+  scheduler: "cosine"
+  scheduler_gamma: 0.1
+  scheduler_steps: 10
+  scheduler_step_size: 10
+  scheduler_patience: 10
+
+wandb:
+  project: "yolo_seg"
+  entity: "andrewolvera"
+  run_name: "${run.name}"
+  tags: []
