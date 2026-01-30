@@ -26,3 +26,4 @@ OPTIMIZATION_SUMMARY.md
 *.pyc
 /processing/visualization_output
 /Ciclopes-API/video_folder
+/Ciclopes-API/test_video
