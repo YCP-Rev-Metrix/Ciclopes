@@ -23,6 +23,7 @@ training:
   scheduler_steps: 10
   scheduler_step_size: 10
   scheduler_patience: 10
+  output_path: "outputs"
 
 wandb:
   project: "yolo_seg"
