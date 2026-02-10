@@ -76,12 +76,10 @@ def build_yolo_seg_trainer(
 
     train_args = dict(training)
 
-    # Keep output path in config for pipeline logging; YOLO expects 'project'.
     output_path = train_args.pop("output_path", None)
     if output_path:
         train_args.setdefault("project", output_path)
 
-    # Promote common run/wandb metadata into YOLO naming fields when available.
     run_name = run.get("name")
     if run_name:
         train_args.setdefault("name", run_name)

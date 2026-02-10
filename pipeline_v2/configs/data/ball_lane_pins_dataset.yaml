@@ -3,7 +3,7 @@ path: data/ball_lane_pins_dataset
 train: images/train
 val: images/val
 
-# Update this list/count to match your final dataset labels.
+# Update per data
 names:
   0: ball
   1: lane

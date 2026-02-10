@@ -17,7 +17,7 @@ training:
   output_path: runs/pipeline_v2/yolo26n-seg
   epochs: 200
   batch: 16
-  imgsz: 1280
+  imgsz: 640
   workers: ${data.workers}
   device: 0
   cache: disk
