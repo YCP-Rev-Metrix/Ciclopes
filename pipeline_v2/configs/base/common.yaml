@@ -1,32 +1,37 @@
 run:
   name: null
   seed: 42
-  mode: null
+  mode: train
+
+trainer:
+  type: yolo_seg
 
 model:
-  name: null
+  name: yolo26n-seg.pt
 
 data:
-  name: null
-  path: null
+  name: ball_lane_pins_dataset
+  path: configs/data/ball_lane_pins_dataset.yaml
   workers: 8
 
 training:
-  batch_size: 16
+  output_path: runs/pipeline_v2
   epochs: 100
-  learning_rate: 0.001
-  weight_decay: 0.0001
-  momentum: 0.9
-  optimizer: "adam"
-  scheduler: "cosine"
-  scheduler_gamma: 0.1
-  scheduler_steps: 10
-  scheduler_step_size: 10
-  scheduler_patience: 10
-  output_path: "outputs"
+  batch: 8
+  imgsz: 1024
+  workers: ${data.workers}
+  device: 0
+  cache: disk
+  pretrained: true
+  val: true
+  save: true
+  plots: true
+  exist_ok: true
+  amp: true
+  deterministic: true
 
 wandb:
-  project: "yolo_seg"
-  entity: "andrewolvera"
-  run_name: "${run.name}"
+  project: yolo_seg
+  entity: andrewolvera
+  run_name: ${run.name}
   tags: []
