@@ -6,62 +6,82 @@ trainer:
   type: yolo_seg
 
 model:
-  name: yolo26n-seg.pt
+  name: yolo26n-seg.pt  
 
 data:
   name: ball_lane_pins_dataset
-  path: configs/data/ball_lane_pins_dataset.yaml
-  workers: 12
+  path: data/data.yaml
+  workers: 4  # Reduced from 6 to reduce memory pressure  
 
 training:
-  output_path: runs/pipeline_v2/yolo26n-seg
-  epochs: 200
-  batch: 16
-  imgsz: 640
-  workers: ${data.workers}
-  device: 0
-  cache: disk
+  output_path: outputs/yolo26n-seg-BLP
 
-  # Optimization
-  lr0: 0.01
-  lrf: 0.01
-  momentum: 0.937
-  weight_decay: 0.0005
+  # Training schedule
+  epochs: 200
+  patience: 50  # Early stopping
+
+  # Image & Batch settings
+  imgsz: 1024
+  batch: 16  # Reduced from 24 to prevent OOM on 16GB GPU    
+
+  # Data loading optimization
+  workers: ${data.workers}
+  cache: disk  
+  device: 0
+
+  # Performance optimization
+  amp: true           
+  close_mosaic: 0     
+
+  # Optimizer
+  optimizer: AdamW
+  lr0: 0.001          
+  lrf: 0.01           
+  momentum: 0.937     
+  weight_decay: 0.0005 
   warmup_epochs: 3.0
   warmup_momentum: 0.8
   warmup_bias_lr: 0.1
 
+  # Learning rate schedule
+  cos_lr: true  
+
   # Augmentation
-  hsv_h: 0.015
-  hsv_s: 0.7
-  hsv_v: 0.4
-  degrees: 0.0
-  translate: 0.1
-  scale: 0.5
-  shear: 0.0
-  perspective: 0.0
-  flipud: 0.0
-  fliplr: 0.5
-  mosaic: 1.0
-  mixup: 0.0
-  copy_paste: 0.1
-  close_mosaic: 10
+  hsv_h: 0.01     
+  hsv_s: 0.3      
+  hsv_v: 0.2      
+  degrees: 0.0    
+  translate: 0.05 
+  scale: 0.3      
+  shear: 0.0      
+  perspective: 0.0 
+  flipud: 0.0     
+  fliplr: 0.5     
+  mosaic: 0.0     
+  mixup: 0.0      
+  copy_paste: 0.0 
 
   # Segmentation-specific
-  overlap_mask: true
-  mask_ratio: 4
+  overlap_mask: true   
+  mask_ratio: 4        
 
-  # Runtime
-  cos_lr: true
+  # Validation & Checkpointing
   val: true
   save: true
-  plots: true
+  save_period: 20  # Save checkpoints less frequently (was 10)
+  plots: false     # Disable plot generation to save disk space (was true)
   exist_ok: true
-  amp: true
-  deterministic: true
+
+  # Deterministic training for reproducibility
+  deterministic: false  
+
+  # Additional optimizations
+  rect: false  
+  multi_scale: false  
 
 wandb:
-  project: yolo_seg
+  project: ciclopes-yolo-seg
   entity: andrewolvera
   run_name: ${run.name}
-  tags: [yolo, seg, exp1, yolo26n]
+  tags: [yolo26n, segmentation, bowling, indoor, lane, ball, pins, AdamW]
+  notes: "Dataset pre-augmented 7x | Minimal training augs | AdamW optimizer | 1024px | batch=24"

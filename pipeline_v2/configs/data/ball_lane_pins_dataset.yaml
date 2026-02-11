@@ -1,10 +1,12 @@
-# Ultralytics dataset config
-path: data/ball_lane_pins_dataset
-train: images/train
-val: images/val
+# Ultralytics YOLOv26 Segmentation Dataset
+# This config points to the extracted Roboflow dataset
+path: /workspace/data  # Absolute path when running in Docker
+train: train/images
+val: valid/images
+test: test/images
 
-# Update per data
+nc: 3
 names:
   0: ball
   1: lane
-  2: pin
+  2: pins

@@ -1,6 +1,6 @@
 import argparse
 
-from builders import trainer as _trainer_builders  # noqa: F401
+from builders import trainer as _trainer_builders
 from core.config import Config
 from core.registry import build
 

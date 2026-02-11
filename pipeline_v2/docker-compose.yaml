@@ -1,0 +1,43 @@
+services:
+  ciclopes:
+    build: .
+    image: ciclopes:latest
+    container_name: ciclopes
+
+    # GPU access for RTX 5070 Ti (16GB)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Mount project directory for live code changes
+    volumes:
+      - .:/workspace
+      - ./cache:/workspace/cache                          # HuggingFace/model cache
+      - ./outputs:/workspace/outputs                      # Model outputs
+      - ./runs:/workspace/runs                            # Training runs
+      - ~/.cache/huggingface:/root/.cache/huggingface    # Share HF cache with host
+
+    # Keep container running for interactive CLI
+    stdin_open: true
+    tty: true
+
+    # Override default command to keep alive
+    command: tail -f /dev/null
+
+    # Increase shared memory for PyTorch DataLoader multiprocessing
+    shm_size: '8gb'  # Essential for multi-worker data loading
+
+    # Environment variables
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - WANDB_API_KEY=${WANDB_API_KEY}  # Pass from host environment
+      - PYTHONPATH=/workspace/src:/workspace  # Fix imports for src modules
+
+    # Port mappings (optional)
+    ports:
+      - "6006:6006"  # TensorBoard (if needed)
+      - "8888:8888"  # Jupyter (if needed)

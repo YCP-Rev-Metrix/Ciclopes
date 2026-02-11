@@ -13,10 +13,12 @@ class YoloSegTrainer:
         model_name: str,
         data_yaml: str,
         train_args: Dict[str, Any] | None = None,
+        wandb_config: Dict[str, Any] | None = None,
     ):
         self.model_name = self._resolve_model_ref(model_name)
         self.data_yaml = self._resolve_data_yaml(data_yaml)
         self.train_args = dict(train_args or {})
+        self.wandb_config = dict(wandb_config or {})
 
         self.model = YOLO(self.model_name)
 
@@ -54,6 +56,22 @@ class YoloSegTrainer:
         if not Path(self.data_yaml).exists():
             raise FileNotFoundError(f"Data YAML not found: {self.data_yaml}")
 
+        # Configure W&B integration if provided
+        import os
+        if self.wandb_config:
+            # Set W&B environment variables for Ultralytics integration
+            if self.wandb_config.get("project"):
+                os.environ["WANDB_PROJECT"] = self.wandb_config["project"]
+            if self.wandb_config.get("entity"):
+                os.environ["WANDB_ENTITY"] = self.wandb_config["entity"]
+            if self.wandb_config.get("run_name"):
+                os.environ["WANDB_NAME"] = self.wandb_config["run_name"]
+
+            print(f"[W&B] Logging enabled:")
+            print(f"  - Project: {self.wandb_config.get('project')}")
+            print(f"  - Entity: {self.wandb_config.get('entity')}")
+            print(f"  - Run: {self.wandb_config.get('run_name')}")
+
         return self.model.train(data=self.data_yaml, **self.train_args)
 
 
@@ -84,12 +102,9 @@ def build_yolo_seg_trainer(
     if run_name:
         train_args.setdefault("name", run_name)
 
-    # Keep wandb accepted by signature for future integration, but do not
-    # overload YOLO's 'project' output directory with wandb project names.
-    _ = wandb
-
     return YoloSegTrainer(
         model_name=model_name,
         data_yaml=data_yaml,
         train_args=train_args,
+        wandb_config=wandb,
     )

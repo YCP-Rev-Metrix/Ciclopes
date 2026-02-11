@@ -27,3 +27,7 @@ OPTIMIZATION_SUMMARY.md
 /processing/visualization_output
 /Ciclopes-API/video_folder
 /Ciclopes-API/test_video
+/.claude
+/pipeline_v2/data
+/pipeline_v2/runs
+*.pt
