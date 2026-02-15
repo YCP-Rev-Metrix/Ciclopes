@@ -11,18 +11,18 @@ model:
 data:
   name: ball_lane_pins_dataset
   path: data/data.yaml
-  workers: 4  # Reduced from 6 to reduce memory pressure  
+  workers: 4
 
 training:
   output_path: outputs/yolo26n-seg-BLP
 
   # Training schedule
   epochs: 200
-  patience: 50  # Early stopping
+  patience: 50
 
   # Image & Batch settings
   imgsz: 1024
-  batch: 16  # Reduced from 24 to prevent OOM on 16GB GPU    
+  batch: 16
 
   # Data loading optimization
   workers: ${data.workers}
@@ -68,8 +68,8 @@ training:
   # Validation & Checkpointing
   val: true
   save: true
-  save_period: 20  # Save checkpoints less frequently (was 10)
-  plots: false     # Disable plot generation to save disk space (was true)
+  save_period: 20
+  plots: false
   exist_ok: true
 
   # Deterministic training for reproducibility

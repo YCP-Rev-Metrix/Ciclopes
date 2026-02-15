@@ -1,6 +1,4 @@
-# Ultralytics YOLOv26 Segmentation Dataset
-# This config points to the extracted Roboflow dataset
-path: /workspace/data  # Absolute path when running in Docker
+path: /workspace/data
 train: train/images
 val: valid/images
 test: test/images

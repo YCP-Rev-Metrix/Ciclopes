@@ -16,8 +16,11 @@ AI Generated -- needs verified / cleaned
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import shutil
+import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 import requests
 
@@ -115,4 +118,81 @@ def download_presigned_url_to_file(
         for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
             if chunk:
                 out.write(chunk)
+
+
+@contextmanager
+def query_video_to_temp_file(
+    *,
+    input_path_or_url: str,
+    verify: Optional[bool] = None,
+) -> Iterator[Path]:
+    """
+    Resolve an input video reference (local path or HTTP(S) URL) into a local temp file.
+    The temp file is cleaned up automatically when the context exits.
+    """
+    with tempfile.TemporaryDirectory(prefix="ciclopes-video-") as td:
+        temp_path = Path(td) / "queried_video.mp4"
+        candidate = input_path_or_url.strip()
+        is_http = candidate.startswith("http://") or candidate.startswith("https://")
+
+        if is_http:
+            kwargs = {"stream": True, "timeout": 60}
+            if verify is not None:
+                kwargs["verify"] = verify
+
+            resp = requests.get(candidate, **kwargs)
+            if resp.status_code != 200:
+                raise SpacesApiError(
+                    f"Query video download failed: status={resp.status_code}, body={resp.text}"
+                )
+
+            with temp_path.open("wb") as out:
+                for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
+                    if chunk:
+                        out.write(chunk)
+        else:
+            source_path = Path(candidate)
+            if not source_path.exists():
+                raise FileNotFoundError(str(source_path))
+            shutil.copy2(source_path, temp_path)
+
+        yield temp_path
+
+
+@contextmanager
+def query_video_via_api_to_temp_file(
+    *,
+    base: str,
+    verify_api: bool,
+    username: str,
+    password: str,
+    key: str,
+    ttl_seconds: int = 600,
+    verify_presigned: Optional[bool] = None,
+) -> Iterator[Path]:
+    """
+    Resolve a protected video object key to a local temp file using:
+    authorize -> presign -> download.
+    """
+    with tempfile.TemporaryDirectory(prefix="ciclopes-video-") as td:
+        temp_path = Path(td) / "queried_video.mp4"
+        token = authorize(
+            base=base,
+            verify=verify_api,
+            username=username,
+            password=password,
+        )
+        presigned_url = get_presigned_url(
+            base=base,
+            verify=verify_api,
+            token=token,
+            key=key,
+            ttl_seconds=ttl_seconds,
+        )
+        download_presigned_url_to_file(
+            url=presigned_url,
+            out_path=temp_path,
+            verify=verify_presigned,
+        )
+        yield temp_path
 

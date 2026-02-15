@@ -1,18 +1,35 @@
-from fastapi import APIRouter
-import os
-import tempfile
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Request
 from pathlib import Path
+
+from pydantic import BaseModel, Field
+import torch
 
 router = APIRouter(
     prefix="/test",
     tags=["test"],
 )
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+def _get_inference_engine(request: Request):
+    engine = getattr(request.app.state, "inference_engine", None)
+    if engine is None:
+        raise HTTPException(status_code=503, detail="InferenceEngine is not initialized")
+    return engine
+
+
+def _summarize_tensor_list(tensors: list[torch.Tensor]) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for tensor in tensors:
+        summaries.append(
+            {
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "device": str(tensor.device),
+            }
+        )
+    return summaries
 
 def assert_video_split():
     """
@@ -78,171 +95,165 @@ def assert_video_split():
     }
 
 
-def assert_example_bucket_setup(batch_size: int = 8, ttl_seconds: int = 600):
-    """
-    End-to-end *bucket* smoke test for the inference plumbing:
+class QueryVideoInferenceInput(BaseModel):
+    input_path_or_url: str | None = Field(
+        default=None,
+        description="Local filesystem path or direct HTTP(S) URL",
+    )
+    verify_tls: bool | None = Field(
+        default=None,
+        description="Optional TLS verification override for direct HTTP(S) URLs",
+    )
+    api_base: str | None = Field(
+        default=None,
+        description="Base API URL for auth/presign flow, e.g. https://api.revmetrix.io",
+    )
+    username: str | None = Field(default=None, description="API username for authorize endpoint")
+    password: str | None = Field(default=None, description="API password for authorize endpoint")
+    video_key: str | None = Field(
+        default=None,
+        description="Object key/path passed to /api/videos/presign (ex: videos/abc.mp4)",
+    )
+    verify_api: bool = Field(default=True, description="TLS verification for authorize/presign requests")
+    verify_presigned: bool | None = Field(
+        default=None,
+        description="Optional TLS verification override for the presigned download URL",
+    )
+    ttl_seconds: int = Field(default=600, ge=1, le=86400)
 
-    - authenticate (JWT)
-    - presign a Spaces object (optionally upload a test video first)
-    - download to a temp file
-    - split into frames via OpenCV (SplitVideo)
-    - batch frames into torch tensors ready for inference
-    - assert shapes/dtypes/ranges
 
-    Env (no secrets in code):
-    - REV_TEST_BASE (default: https://api.revmetrix.io)
-    - REV_TEST_VERIFY (default: true) - TLS verify when calling REV_TEST_BASE
-    - REV_TEST_USERNAME / REV_TEST_PASSWORD
-
-    Optional:
-    - REV_TEST_VIDEO_KEY: if set, skip upload and just presign this key
-    - REV_TEST_UPLOAD_FOLDER (default: videos)
-    - REV_TEST_PRESIGNED_VERIFY (default: true) - TLS verify for the presigned download URL
-
-    AI Generated test
-    """
+def assert_query_split_batch16_infer(request: Request, payload: QueryVideoInferenceInput):
     try:
+        from core.VideoUtil.FrameSplit import batch_split_video, split_video_into_frames
         from core.VideoUtil.SpacesApiClient import (
-            authorize,
-            upload_video,
-            get_presigned_url,
-            download_presigned_url_to_file,
+            query_video_to_temp_file,
+            query_video_via_api_to_temp_file,
         )
-        from core.VideoUtil.FrameSplit import split_video_into_frames, batch_split_video
     except Exception as e:
         return {"ok": False, "stage": "import", "error": repr(e)}
 
-    base = "https://api.revmetrix.io"
-    verify_api = True
-    verify_presigned = True
-
-    username = "string"
-    password = "string"
-    if not username or not password:
-        return {"ok": False, "stage": "env", "error": "Missing REV_TEST_USERNAME / REV_TEST_PASSWORD"}
-
-    if batch_size <= 0:
-        return {"ok": False, "stage": "params", "error": "batch_size must be > 0"}
-
-    existing_key = None
-    upload_folder = "videos"
-
-    api_root = Path(__file__).resolve().parents[3]  # .../Ciclopes-API
-    input_video = api_root / "test_video" / "test_vid.mp4"
-    if not input_video.exists() and not existing_key:
+    engine = _get_inference_engine(request)
+    batch_size = 16
+    use_api_query = bool(payload.api_base and payload.username and payload.password and payload.video_key)
+    use_direct_query = bool(payload.input_path_or_url)
+    if not use_api_query and not use_direct_query:
         return {
             "ok": False,
-            "stage": "path",
-            "error": "test video not found (and no REV_TEST_VIDEO_KEY provided)",
-            "expected_path": str(input_video),
+            "stage": "input",
+            "error": (
+                "Provide either input_path_or_url for direct query OR "
+                "api_base + username + password + video_key for auth/presign query"
+            ),
         }
 
+    source_mode = "api_presign" if use_api_query else "direct"
     try:
-        token = authorize(base=base, verify=verify_api, username=username, password=password)
-    except Exception as e:
-        return {"ok": False, "stage": "authorize", "error": repr(e), "base": base}
-
-    try:
-        if existing_key:
-            key = existing_key
-            uploaded = False
-        else:
-            key = upload_video(
-                base=base,
-                verify=verify_api,
-                token=token,
-                file_path=input_video,
-                folder=upload_folder,
+        if use_api_query:
+            temp_video_ctx = query_video_via_api_to_temp_file(
+                base=payload.api_base or "",
+                verify_api=payload.verify_api,
+                username=payload.username or "",
+                password=payload.password or "",
+                key=payload.video_key or "",
+                ttl_seconds=payload.ttl_seconds,
+                verify_presigned=payload.verify_presigned,
             )
-            uploaded = True
-    except Exception as e:
-        return {"ok": False, "stage": "upload", "error": repr(e), "base": base}
+        else:
+            temp_video_ctx = query_video_to_temp_file(
+                input_path_or_url=payload.input_path_or_url or "",
+                verify=payload.verify_tls,
+            )
 
-    try:
-        url = get_presigned_url(
-            base=base,
-            verify=verify_api,
-            token=token,
-            key=key,
-            ttl_seconds=ttl_seconds,
-        )
-    except Exception as e:
-        return {"ok": False, "stage": "presign", "error": repr(e), "base": base, "key": key}
-
-    # Windows-friendly: create a real temp path, close it, then let OpenCV open by path.
-    try:
-        with tempfile.TemporaryDirectory(prefix="ciclopes-video-") as td:
-            temp_path = Path(td) / "downloaded.mp4"
-            download_presigned_url_to_file(url=url, out_path=temp_path, verify=verify_presigned)
-
-            split_video = split_video_into_frames(str(temp_path))
+        with temp_video_ctx as temp_video_path:
+            split_video = split_video_into_frames(str(temp_video_path))
             frame_count = len(split_video.frames)
-
-            # Convert frames into inference-ready tensor batches.
-            batches = batch_split_video(split_video, batch_size=batch_size, rgb=True, normalize=True)
+            batches = batch_split_video(
+                split_video,
+                batch_size=batch_size,
+                rgb=True,
+                normalize=True,
+                drop_last=True,
+            )
+            output = engine.forward(batches)
     except Exception as e:
-        return {"ok": False, "stage": "download/split/batch", "error": repr(e)}
+        return {"ok": False, "stage": "query/split/batch/infer", "error": repr(e)}
 
-    # --- Assertions / diagnostics ---
-    ok = True
-    ok = ok and split_video.fps > 0
-    ok = ok and split_video.width > 0 and split_video.height > 0
-    ok = ok and frame_count > 0
+    output_batches = output.get("test")
+    if not isinstance(output_batches, list) or not all(isinstance(t, torch.Tensor) for t in output_batches):
+        return {"ok": False, "stage": "infer", "error": "InferenceEngine returned unexpected structure"}
 
     expected_batches = frame_count // batch_size
-    ok = ok and len(batches) == expected_batches
-
-    first_frame_shape = None
-    if frame_count:
-        img0 = split_video.frames[0].image
-        first_frame_shape = getattr(img0, "shape", None)
-        if first_frame_shape is not None and len(first_frame_shape) >= 2:
-            ok = ok and int(first_frame_shape[0]) == int(split_video.height)
-            ok = ok and int(first_frame_shape[1]) == int(split_video.width)
-
-    first_batch_shape = None
-    first_batch_dtype = None
-    first_batch_minmax = None
-    if batches:
-        b0 = batches[0]
-        first_batch_shape = list(b0.shape)
-        first_batch_dtype = str(b0.dtype)
-
-        # Expected: (B, 3, H, W) float32 normalized to [0, 1].
-        ok = ok and b0.ndim == 4
-        ok = ok and int(b0.shape[0]) == int(batch_size)
-        ok = ok and int(b0.shape[1]) == 3
-        ok = ok and int(b0.shape[2]) == int(split_video.height)
-        ok = ok and int(b0.shape[3]) == int(split_video.width)
-
-        # Sample to keep this endpoint cheap even for long videos.
-        sample = b0[:1, :, :32, :32]
-        mn = float(sample.min().item())
-        mx = float(sample.max().item())
-        first_batch_minmax = [mn, mx]
-        ok = ok and mn >= 0.0 and mx <= 1.0
+    same_count = len(output_batches) == len(batches) == expected_batches
+    all_shapes_ok = all(
+        list(t.shape) == [batch_size, 3, split_video.height, split_video.width] for t in output_batches
+    )
+    input_path = (payload.input_path_or_url or "").strip()
+    is_http = input_path.startswith("http://") or input_path.startswith("https://")
 
     return {
-        "ok": bool(ok),
-        "base": base,
-        "verify_api": bool(verify_api),
-        "verify_presigned": bool(verify_presigned),
-        "uploaded_test_video": bool(uploaded),
-        "key": key,
-        "ttl_seconds": int(ttl_seconds),
+        "ok": bool(frame_count > 0 and same_count and all_shapes_ok),
+        "source_mode": source_mode,
+        "input_path_or_url": input_path if input_path else None,
+        "input_type": ("url" if is_http else "path") if input_path else None,
+        "api_base": payload.api_base,
+        "video_key": payload.video_key,
+        "engine_status": engine.status(),
         "fps": float(split_video.fps),
         "width": int(split_video.width),
         "height": int(split_video.height),
         "frame_count": int(frame_count),
-        "batch_size": int(batch_size),
+        "batch_size": batch_size,
         "expected_batches": int(expected_batches),
-        "batches": int(len(batches)),
-        "first_frame_shape": first_frame_shape,
-        "first_batch_shape": first_batch_shape,
-        "first_batch_dtype": first_batch_dtype,
-        "first_batch_sample_minmax": first_batch_minmax,
-        "first_timestamp_s": split_video.frames[0].timestamp if frame_count else None,
-        "last_timestamp_s": split_video.frames[-1].timestamp if frame_count else None,
+        "input_batches": int(len(batches)),
+        "output_batches": int(len(output_batches)),
+        "output_batch_summaries": _summarize_tensor_list(output_batches),
+        "note": "drop_last=True; videos with fewer than 16 frames yield zero batches",
+    }
+
+
+def assert_inference_engine_batch_roundtrip(
+    request: Request,
+    batch_count: int = 2,
+    batch_size: int = 4,
+    channels: int = 3,
+    height: int = 32,
+    width: int = 32,
+):
+    if batch_count <= 0 or batch_size <= 0 or channels <= 0 or height <= 0 or width <= 0:
+        return {"ok": False, "error": "All dimensions and counts must be > 0"}
+
+    engine = _get_inference_engine(request)
+    input_batches = [
+        torch.rand(batch_size, channels, height, width, dtype=torch.float32)
+        for _ in range(batch_count)
+    ]
+
+    output = engine.forward(input_batches)
+    output_batches = output.get("test")
+    if not isinstance(output_batches, list) or not all(isinstance(t, torch.Tensor) for t in output_batches):
+        return {"ok": False, "error": "InferenceEngine returned unexpected structure"}
+
+    same_count = len(output_batches) == len(input_batches)
+    same_shapes = all(out.shape == inp.shape for out, inp in zip(output_batches, input_batches))
+
+    return {
+        "ok": bool(same_count and same_shapes),
+        "engine_status": engine.status(),
+        "input_batch_count": len(input_batches),
+        "output_batch_count": len(output_batches),
+        "input_batches": _summarize_tensor_list(input_batches),
+        "output_batches": _summarize_tensor_list(output_batches),
+    }
+
+
+def assert_inference_engine_echo_payload(request: Request, payload: dict[str, Any]):
+    engine = _get_inference_engine(request)
+    output = engine.forward(payload)
+    return {
+        "ok": True,
+        "engine_status": engine.status(),
+        "input": payload,
+        "output": output,
     }
 
 @router.get("/health")
@@ -253,6 +264,38 @@ async def health():
 async def query_video():
     return assert_video_split()
 
-@router.get("/example_bucket_setup_test")
-async def example_bucket_setup_test(batch_size: int = 8, ttl_seconds: int = 600):
-    return assert_example_bucket_setup(batch_size=batch_size, ttl_seconds=ttl_seconds)
+@router.post("/query_split_batch16_inference_test")
+async def query_split_batch16_inference_test(
+    request: Request, payload: QueryVideoInferenceInput
+):
+    return assert_query_split_batch16_infer(request=request, payload=payload)
+
+
+@router.get("/inference_engine_status")
+async def inference_engine_status(request: Request):
+    engine = _get_inference_engine(request)
+    return {"ok": True, "engine_status": engine.status()}
+
+
+@router.get("/inference_engine_batch_roundtrip")
+async def inference_engine_batch_roundtrip(
+    request: Request,
+    batch_count: int = 2,
+    batch_size: int = 4,
+    channels: int = 3,
+    height: int = 32,
+    width: int = 32,
+):
+    return assert_inference_engine_batch_roundtrip(
+        request=request,
+        batch_count=batch_count,
+        batch_size=batch_size,
+        channels=channels,
+        height=height,
+        width=width,
+    )
+
+
+@router.post("/inference_engine_echo")
+async def inference_engine_echo(request: Request, payload: dict[str, Any]):
+    return assert_inference_engine_echo_payload(request=request, payload=payload)

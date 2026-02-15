@@ -1,9 +1,22 @@
+from contextlib import asynccontextmanager
+import logging
+
 from fastapi import FastAPI
-from src.modules.router import router as api_router
 import uvicorn
 
+from core.InferenceEngine.InferenceEngine import InferenceEngine
+from src.modules.router import router as api_router
+
+logging.basicConfig(level=logging.INFO)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.inference_engine = InferenceEngine()
+    yield
+
 def create_app() -> FastAPI:
-    app = FastAPI()
+    app = FastAPI(lifespan=lifespan)
     app.include_router(api_router)
     return app
 
