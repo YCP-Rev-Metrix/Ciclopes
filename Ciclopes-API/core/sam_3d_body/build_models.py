@@ -40,12 +40,13 @@ def load_sam_3d_body(checkpoint_path: str = "", device: str = "cuda", mhr_path: 
     return model, model_cfg
 
 
-def _hf_download(repo_id):
+def _hf_download(repo_id: str, token: str | None = None):
     from huggingface_hub import snapshot_download
-    local_dir = snapshot_download(repo_id=repo_id)
+
+    local_dir = snapshot_download(repo_id=repo_id, token=token)
     return os.path.join(local_dir, "model.ckpt"), os.path.join(local_dir, "assets", "mhr_model.pt")
 
 
-def load_sam_3d_body_hf(repo_id, **kwargs):
-    ckpt_path, mhr_path = _hf_download(repo_id)
-    return load_sam_3d_body(checkpoint_path=ckpt_path, mhr_path=mhr_path)
+def load_sam_3d_body_hf(repo_id: str, token: str | None = None, **kwargs):
+    ckpt_path, mhr_path = _hf_download(repo_id=repo_id, token=token)
+    return load_sam_3d_body(checkpoint_path=ckpt_path, mhr_path=mhr_path, **kwargs)

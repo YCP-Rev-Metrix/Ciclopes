@@ -1,0 +1,38 @@
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+
+# ── Environment — RTX 5070 Ti (Blackwell, sm_120) optimized ──────────────────
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TORCH_ALLOW_TF32_CUBLAS=1 \
+    CUDA_MODULE_LOADING=LAZY \
+    TORCH_CUDNN_V8_API_ENABLED=1
+
+# ── System deps (OpenCV, OpenGL, git for torch.hub) ─────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git curl ca-certificates \
+      build-essential g++ gcc \
+      libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1 \
+      libgl1-mesa-glx libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ── Python deps (layer-cached for faster rebuilds) ──────────────────────────
+COPY requirements.txt /app/requirements.txt
+RUN pip install --upgrade pip && \
+    pip install -r /app/requirements.txt && \
+    # Force nightly PyTorch for RTX 5070 Ti (sm_120) support
+    pip install --upgrade --force-reinstall \
+        --extra-index-url https://download.pytorch.org/whl/nightly/cu124 \
+        torch torchvision torchaudio
+
+# ── Copy project code ────────────────────────────────────────────────────────
+COPY . /app
+
+ENV PYTHONPATH=/app:/app/core
+
+EXPOSE 8000
+
+# ── Run the FastAPI service ──────────────────────────────────────────────────
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
