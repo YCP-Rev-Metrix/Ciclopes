@@ -7,25 +7,21 @@ from typing import Any
 import numpy as np
 from ultralytics import YOLO
 
+from core.LaneBalls.Preprocessing import InferencePreprocessConfig, normalize_model_names
+
 logger = logging.getLogger("ciclopes.lane_ball_inference")
 
-# ── Weight path (relative to Ciclopes-API root) ──────────────────────────────
+# Weight path relative to Ciclopes-API root.
 _API_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_WEIGHT_PATH = str(_API_ROOT / "core" / "weights" / "best_v2_26n.pt")
 
-# ── Class mapping matching the YOLO seg training config ───────────────────────
+# Class mapping matching yolo26n-seg training.
 CLASS_NAMES = {0: "ball", 1: "lane", 2: "pins"}
 
 
 class LaneBallInference:
     """
-    YOLO v26n segmentation model for bowling lane, ball, and pin detection.
-
-    Loads from a local .pt checkpoint and runs instance-segmentation inference.
-    The model was trained via pipeline_v2 with yolo26n-seg on 3 classes:
-        0 → ball
-        1 → lane
-        2 → pins
+    YOLO segmentation model for ball, lane, and pins.
     """
 
     def __init__(self, device: str = "cuda") -> None:
@@ -34,38 +30,45 @@ class LaneBallInference:
         self.model = YOLO(_DEFAULT_WEIGHT_PATH)
         self.model.to(device)
         self.device = device
+        self.preprocess_cfg = InferencePreprocessConfig()
+        self.model_names = normalize_model_names(getattr(self.model, "names", None))
 
         logger.info("YOLO seg model loaded on device=%s", device)
-
-    # ── Raw inference ─────────────────────────────────────────────────────────
 
     def infer(self, image: np.ndarray | str) -> list:
         """
         Run segmentation on a single image.
-
-        Args:
-            image: RGB numpy array (H, W, 3) or file path string.
-
-        Returns:
-            List of ultralytics Results objects.
         """
-        return self.model.predict(image, verbose=False)
+        return self.model.predict(
+            image,
+            verbose=False,
+            imgsz=self.preprocess_cfg.imgsz,
+            conf=self.preprocess_cfg.conf,
+            iou=self.preprocess_cfg.iou,
+            device=self.device,
+            retina_masks=True,
+        )
 
-    # ── Structured mask extraction for JSON serialization ─────────────────────
+    def infer_batch(self, images: list[np.ndarray]) -> list:
+        """
+        Run segmentation on a batch of RGB frames.
+        """
+        if not images:
+            return []
+        return self.model.predict(
+            source=images,
+            verbose=False,
+            imgsz=self.preprocess_cfg.imgsz,
+            conf=self.preprocess_cfg.conf,
+            iou=self.preprocess_cfg.iou,
+            device=self.device,
+            retina_masks=True,
+        )
 
     @staticmethod
     def extract_masks(results: list) -> dict[str, list[dict[str, Any]]]:
         """
         Convert YOLO Results into a JSON-friendly dict grouped by class.
-
-        Returns:
-            {
-                "ball":  [{"confidence": 0.95, "bbox": [x1,y1,x2,y2], "mask_shape": [H,W]}, ...],
-                "lane":  [...],
-                "pins":  [...]
-            }
-
-        Each key may have zero or more detections.
         """
         output: dict[str, list[dict[str, Any]]] = {
             name: [] for name in CLASS_NAMES.values()
@@ -74,14 +77,12 @@ class LaneBallInference:
         if not results:
             return output
 
-        result = results[0]  # single-image prediction
-
-        # No detections at all
+        result = results[0]
         if result.boxes is None or len(result.boxes) == 0:
             return output
 
         boxes = result.boxes
-        masks = result.masks  # may be None if model found boxes but no masks
+        masks = result.masks
 
         for idx in range(len(boxes)):
             cls_id = int(boxes.cls[idx].item())
@@ -92,10 +93,8 @@ class LaneBallInference:
                 "bbox": [round(float(v), 2) for v in boxes.xyxy[idx].tolist()],
             }
 
-            # Attach mask shape if masks are available
             if masks is not None and idx < len(masks.data):
-                mask_tensor = masks.data[idx]  # (H, W) binary mask
-                detection["mask_shape"] = list(mask_tensor.shape)
+                detection["mask_shape"] = list(masks.data[idx].shape)
 
             output.setdefault(cls_name, []).append(detection)
 

@@ -1,23 +1,32 @@
 from __future__ import annotations
-from typing import Optional, List, Any
-from dataclasses import dataclass
+
+from dataclasses import dataclass, field
+from typing import List
+
 
 @dataclass
 class BallPos:
-    x: float
-    y: float
+    frame_index: int
+    timestamp_s: float
+    x_m: float
+    y_m: float
+
 
 @dataclass
 class BallPosList:
-    ball_positions: List[BallPos] = []
+    ball_positions: List[BallPos] = field(default_factory=list)
+
+
+@dataclass
+class QuarterKinematics:
+    quarter: int
+    start_m: float
+    end_m: float
+    mean_speed_mps: float
+    mean_acceleration_mps2: float
+    sample_count: int
+
 
 @dataclass
 class Kinematics:
-    q1_velocity: float
-    q1_acceleration: float
-    q2_velocity: float
-    q2_acceleration: float
-    q3_velocity: float
-    q3_acceleration: float
-    q4_velocity: float
-    q4_acceleration: float
+    quarters: List[QuarterKinematics] = field(default_factory=list)

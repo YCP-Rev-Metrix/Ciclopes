@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import cv2
@@ -28,6 +29,14 @@ class InferenceTestInput(BaseModel):
     username: str = Field(..., description="API username for /api/posts/Authorize")
     password: str = Field(..., description="API password")
     video_key: str = Field(..., description="Object key for /api/videos/presign, e.g. videos/abc.mp4")
+
+
+class LaneBallPostprocessTestInput(InferenceTestInput):
+    start_frame: int = Field(
+        0,
+        ge=0,
+        description="Frame index where homography search begins",
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -153,5 +162,102 @@ async def run_inference_test(request: Request, payload: InferenceTestInput):
         # First-frame segmentation masks from YOLO (ball / lane / pins)
         "first_frame_segmentation": inference_output["segmentation"],
 
+        "engine_status": engine.status(),
+    }
+
+
+@router.post("/run_lane_ball_postprocessing")
+async def run_lane_ball_postprocessing_test(
+    request: Request, payload: LaneBallPostprocessTestInput
+):
+    """
+    End-to-end lane-ball test:
+      1. Query and split video
+      2. Run lane/ball segmentation on all frames
+      3. Find first trapezoidal center-lane segmentation from start_frame
+      4. Compute homography, project ball positions (x,y in meters), and kinematics
+    """
+    from core.VideoUtil.FrameSplit import split_video_into_frames
+    from core.VideoUtil.SpacesApiClient import query_video_via_api_to_temp_file
+
+    request_t0 = time.perf_counter()
+    engine = _get_engine(request)
+
+    try:
+        temp_ctx = query_video_via_api_to_temp_file(
+            base=payload.api_base,
+            verify_api=True,
+            username=payload.username,
+            password=payload.password,
+            key=payload.video_key,
+            ttl_seconds=3600,
+            verify_presigned=True,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Video query failed: {exc}")
+
+    with temp_ctx as temp_path:
+        split_video = split_video_into_frames(str(temp_path))
+
+    frame_count = len(split_video.frames)
+    fps = float(split_video.fps) if split_video.fps > 0 else 30.0
+
+    if frame_count == 0:
+        return {
+            "ok": False,
+            "error": "Video produced zero frames",
+            "video_info": {
+                "fps": fps,
+                "width": int(split_video.width),
+                "height": int(split_video.height),
+                "frame_count": 0,
+                "start_frame": payload.start_frame,
+            },
+        }
+
+    if payload.start_frame >= frame_count:
+        raise HTTPException(
+            status_code=422,
+            detail=f"start_frame={payload.start_frame} is out of range (frame_count={frame_count})",
+        )
+
+    rgb_frames = [cv2.cvtColor(vf.image, cv2.COLOR_BGR2RGB) for vf in split_video.frames]
+
+    try:
+        lane_ball_output = await engine.forward_lane_ball(
+            frames_rgb=rgb_frames,
+            fps=fps,
+            start_frame=payload.start_frame,
+        )
+    except Exception as exc:
+        logger.exception("LaneBall postprocessing test failed")
+        raise HTTPException(status_code=500, detail=f"LaneBall pipeline error: {exc}")
+
+    total_ms = (time.perf_counter() - request_t0) * 1000.0
+    pipeline_ok = "error" not in lane_ball_output.get("health", {})
+
+    return {
+        "ok": pipeline_ok,
+        "video_info": {
+            "fps": fps,
+            "width": int(split_video.width),
+            "height": int(split_video.height),
+            "frame_count": frame_count,
+            "start_frame": payload.start_frame,
+        },
+        "error": lane_ball_output["health"].get("error"),
+        "is_trapezoid": lane_ball_output["is_trapezoid"],
+        "homography_frame": lane_ball_output["homography_frame"],
+        "ball_positions": lane_ball_output["positions"],
+        "kinematics": lane_ball_output["kinematics"],
+        "homography": {
+            "src_corners": lane_ball_output["homography_src_corners"],
+            "dst_corners_m": lane_ball_output["homography_dst_corners_m"],
+            "matrix": lane_ball_output["homography_matrix"],
+        },
+        "health": {
+            **lane_ball_output["health"],
+            "total_ms": round(total_ms, 2),
+        },
         "engine_status": engine.status(),
     }
