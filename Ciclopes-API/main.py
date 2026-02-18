@@ -14,8 +14,8 @@ logger = logging.getLogger("ciclopes.main")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Startup: load both models (YOLO seg + SAM 3D Body) into VRAM.
-    Shutdown: release resources.
+    Startup: load both models (YOLO seg + SAM 3D Body) into VRAM
+    Shutdown: release resources
     """
     logger.info("Loading inference models — this may take a moment on first run...")
     app.state.inference_engine = InferenceEngine()

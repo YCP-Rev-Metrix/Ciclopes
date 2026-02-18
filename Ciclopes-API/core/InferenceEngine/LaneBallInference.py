@@ -11,19 +11,15 @@ from core.LaneBalls.Preprocessing import InferencePreprocessConfig, normalize_mo
 
 logger = logging.getLogger("ciclopes.lane_ball_inference")
 
-# Weight path relative to Ciclopes-API root.
+# Weight path relative to Ciclopes-API root
 _API_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_WEIGHT_PATH = str(_API_ROOT / "core" / "weights" / "best_v2_26n.pt")
 
-# Class mapping matching yolo26n-seg training.
+# Class mapping matching training
 CLASS_NAMES = {0: "ball", 1: "lane", 2: "pins"}
 
 
 class LaneBallInference:
-    """
-    YOLO segmentation model for ball, lane, and pins.
-    """
-
     def __init__(self, device: str = "cuda") -> None:
         logger.info("Loading YOLO seg model from %s", _DEFAULT_WEIGHT_PATH)
 
@@ -36,9 +32,6 @@ class LaneBallInference:
         logger.info("YOLO seg model loaded on device=%s", device)
 
     def infer(self, image: np.ndarray | str) -> list:
-        """
-        Run segmentation on a single image.
-        """
         return self.model.predict(
             image,
             verbose=False,
@@ -50,9 +43,6 @@ class LaneBallInference:
         )
 
     def infer_batch(self, images: list[np.ndarray]) -> list:
-        """
-        Run segmentation on a batch of RGB frames.
-        """
         if not images:
             return []
         return self.model.predict(
@@ -67,9 +57,6 @@ class LaneBallInference:
 
     @staticmethod
     def extract_masks(results: list) -> dict[str, list[dict[str, Any]]]:
-        """
-        Convert YOLO Results into a JSON-friendly dict grouped by class.
-        """
         output: dict[str, list[dict[str, Any]]] = {
             name: [] for name in CLASS_NAMES.values()
         }

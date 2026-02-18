@@ -31,3 +31,4 @@ OPTIMIZATION_SUMMARY.md
 /pipeline_v2/data
 /pipeline_v2/runs
 *.pt
+*.mp4

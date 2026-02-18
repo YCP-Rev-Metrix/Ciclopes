@@ -10,8 +10,8 @@ from core.LaneBalls.Preprocessing import FrameSegmentation
 from core.LaneBalls.models import BallPos, BallPosList
 
 
-LANE_LENGTH_M = 18.288  # 60 ft, foul line to head pin
-LANE_WIDTH_M = 1.0541   # 41.5 in
+LANE_LENGTH_M = 18.288 
+LANE_WIDTH_M = 1.0541  
 
 
 @dataclass(frozen=True)
@@ -54,8 +54,6 @@ def _order_corners_tl_tr_br_bl(points: np.ndarray) -> np.ndarray:
 
 
 def _lane_dst_corners_m() -> np.ndarray:
-    # src order is [tl, tr, br, bl]
-    # map to lane meters with y growing from near (foul line) to far (pins).
     return np.array(
         [
             [0.0, LANE_LENGTH_M],
@@ -105,7 +103,7 @@ def _get_center_weighted_lane_mask(
         return merged, 0
 
     scored.sort(key=lambda x: x[0])
-    selected = scored[:2]  # edge case: lane split into two polygons
+    selected = scored[:2]
     for _, single_mask in selected:
         merged = np.maximum(merged, single_mask)
 

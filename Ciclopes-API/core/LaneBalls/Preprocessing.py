@@ -27,7 +27,6 @@ class FrameSegmentation:
 
 
 def to_model_rgb(frame_bgr: np.ndarray) -> np.ndarray:
-    """Convert OpenCV BGR frame to RGB for model inference."""
     if frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3:
         raise ValueError(f"Expected BGR image with shape (H,W,3), got {frame_bgr.shape}")
     return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -50,7 +49,7 @@ def normalize_model_names(raw_names: Mapping[Any, Any] | None) -> Dict[int, str]
 
 def extract_frame_segmentation(result: Any) -> FrameSegmentation:
     """
-    Convert one Ultralytics Results object to binary masks by class.
+    Convert one Ultralytics Results object to binary masks by class
     """
     orig_h, orig_w = getattr(result, "orig_shape", (0, 0))
     if not orig_h or not orig_w:
