@@ -41,6 +41,131 @@ class TrapezoidCandidate:
     y_bottom: int
 
 
+@dataclass
+class TrackedLane:
+    quad: np.ndarray
+    centroid_x: float
+    last_seen_frame: int
+    best_score: float
+    best_quad: np.ndarray
+    best_frame_idx: int
+
+
+class TemporalSmoother:
+    """
+    [Improvement 1] Exponential moving average on per-lane corner positions.
+    Matches lanes across frames by centroid-x proximity. Rejects outlier
+    frames where corners jump too far, preserving the smoothed estimate.
+    Tracks the single best-scoring frame per lane for homography selection.
+    """
+
+    def __init__(
+        self,
+        ema_alpha: float = 0.3,
+        max_match_dist: float = 80.0,
+        max_corner_jump: float = 60.0,
+        stale_frames: int = 30,
+    ):
+        self.ema_alpha = ema_alpha
+        self.max_match_dist = max_match_dist
+        self.max_corner_jump = max_corner_jump
+        self.stale_frames = stale_frames
+        self.tracks: List[TrackedLane] = []
+
+    def update(
+        self,
+        candidates: List[TrapezoidCandidate],
+        frame_idx: int,
+    ) -> List[TrapezoidCandidate]:
+        used_tracks: set[int] = set()
+        smoothed: List[TrapezoidCandidate] = []
+
+        for cand in candidates:
+            cx = float(np.mean(cand.polygon[:, 0]))
+
+            # Match to closest existing track.
+            best_ti: int | None = None
+            best_dist = float("inf")
+            for ti, track in enumerate(self.tracks):
+                if ti in used_tracks:
+                    continue
+                d = abs(cx - track.centroid_x)
+                if d < best_dist and d < self.max_match_dist:
+                    best_dist = d
+                    best_ti = ti
+
+            if best_ti is not None:
+                track = self.tracks[best_ti]
+                used_tracks.add(best_ti)
+
+                corner_dists = np.sqrt(
+                    np.sum(
+                        (cand.polygon.astype(float) - track.quad.astype(float)) ** 2,
+                        axis=1,
+                    )
+                )
+                max_jump = float(np.max(corner_dists))
+
+                if max_jump < self.max_corner_jump:
+                    a = self.ema_alpha
+                    blended = (
+                        a * cand.polygon.astype(float)
+                        + (1.0 - a) * track.quad.astype(float)
+                    )
+                    track.quad = blended.astype(np.int32)
+                # else: outlier frame — keep previous smoothed quad
+
+                track.centroid_x = float(np.mean(track.quad[:, 0]))
+                track.last_seen_frame = frame_idx
+                if cand.score > track.best_score:
+                    track.best_score = cand.score
+                    track.best_quad = cand.polygon.copy()
+                    track.best_frame_idx = frame_idx
+
+                smoothed.append(
+                    TrapezoidCandidate(
+                        polygon=track.quad.copy(),
+                        coverage=cand.coverage,
+                        purity=cand.purity,
+                        score=cand.score,
+                        y_top=int(np.min(track.quad[:, 1])),
+                        y_bottom=int(np.max(track.quad[:, 1])),
+                    )
+                )
+            else:
+                # New track.
+                self.tracks.append(
+                    TrackedLane(
+                        quad=cand.polygon.copy(),
+                        centroid_x=cx,
+                        last_seen_frame=frame_idx,
+                        best_score=cand.score,
+                        best_quad=cand.polygon.copy(),
+                        best_frame_idx=frame_idx,
+                    )
+                )
+                smoothed.append(cand)
+
+        # Expire stale tracks.
+        self.tracks = [
+            t for t in self.tracks if frame_idx - t.last_seen_frame < self.stale_frames
+        ]
+        return smoothed
+
+    def summary(self) -> str:
+        parts: List[str] = []
+        for i, t in enumerate(self.tracks):
+            parts.append(
+                f"  lane track {i}: best_score={t.best_score:.3f} "
+                f"best_frame={t.best_frame_idx}"
+            )
+        return "\n".join(parts) if parts else "  (no tracked lanes)"
+
+
+# ---------------------------------------------------------------------------
+# Video I/O
+# ---------------------------------------------------------------------------
+
 def _transcode_to_mp4(video_path: str) -> str:
     """
     Transcode a video to a temporary mp4 with pixel format that OpenCV can read.
@@ -116,6 +241,10 @@ def split_video_into_frames(video_path: str) -> SplitVideo:
     return split_video
 
 
+# ---------------------------------------------------------------------------
+# Path resolution
+# ---------------------------------------------------------------------------
+
 def resolve_existing_path(path_str: str, *, base_dir: Path) -> Path:
     """
     Resolve absolute or relative path against cwd and pipeline_v2 base.
@@ -156,6 +285,10 @@ def resolve_output_path(output_path_str: str, video_path: Path, *, base_dir: Pat
     return output_file.resolve()
 
 
+# ---------------------------------------------------------------------------
+# Drawing helpers
+# ---------------------------------------------------------------------------
+
 def class_color(class_id: int) -> tuple[int, int, int]:
     # BGR colors for stable per-class overlays.
     palette = {
@@ -173,6 +306,64 @@ def class_color(class_id: int) -> tuple[int, int, int]:
     )
 
 
+TRAPEZOID_COLORS = [
+    (0, 255, 255),   # cyan
+    (255, 0, 255),   # magenta
+    (0, 165, 255),   # orange
+    (255, 255, 0),   # yellow-ish
+    (0, 255, 128),   # spring green
+]
+
+
+def draw_trapezoid_debug(
+    image: np.ndarray,
+    trapezoid: TrapezoidCandidate,
+    *,
+    lane_index: int = 0,
+    frame_idx: int = 0,
+    color: tuple[int, int, int] | None = None,
+) -> None:
+    if color is None:
+        color = TRAPEZOID_COLORS[lane_index % len(TRAPEZOID_COLORS)]
+
+    poly = trapezoid.polygon.reshape((-1, 1, 2))
+
+    # Semi-transparent fill.
+    fill_overlay = image.copy()
+    cv2.fillPoly(fill_overlay, [trapezoid.polygon.reshape((-1, 1, 2))], color)
+    cv2.addWeighted(fill_overlay, 0.2, image, 0.8, 0, dst=image)
+
+    # Thick outline.
+    cv2.polylines(image, [poly], True, color, 3, cv2.LINE_AA)
+
+    # Corner points with labels.
+    corner_labels = ["TL", "TR", "BR", "BL"]
+    for pt_idx in range(4):
+        pt = tuple(trapezoid.polygon[pt_idx].tolist())
+        cv2.circle(image, pt, 6, color, -1, cv2.LINE_AA)
+        cv2.circle(image, pt, 6, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.putText(
+            image, corner_labels[pt_idx],
+            (pt[0] + 8, pt[1] - 4),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA,
+        )
+
+    tl = tuple(trapezoid.polygon[0].tolist())
+    text = (
+        f"lane{lane_index} f{frame_idx} s={trapezoid.score:.2f} "
+        f"c={trapezoid.coverage:.2f} p={trapezoid.purity:.2f}"
+    )
+    cv2.putText(
+        image, text,
+        (int(tl[0]), max(24, int(tl[1]) - 12)),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mask cleanup
+# ---------------------------------------------------------------------------
+
 def clean_mask(mask: np.ndarray, *, close_size: int = 15, open_size: int = 7) -> np.ndarray:
     """
     Aggressively clean a bubbly segmentation mask.
@@ -185,6 +376,21 @@ def clean_mask(mask: np.ndarray, *, close_size: int = 15, open_size: int = 7) ->
     return cleaned
 
 
+def keep_largest_component(mask: np.ndarray) -> np.ndarray:
+    """
+    [Improvement 5] Isolate the largest connected component via
+    cv2.connectedComponentsWithStats. Prevents the convex hull from
+    inflating around stray blobs from neighboring lanes or gutters.
+    """
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return mask
+    # Label 0 is background; find largest foreground component.
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest_label = int(np.argmax(areas)) + 1
+    return (labels == largest_label).astype(np.uint8)
+
+
 def largest_contour(mask: np.ndarray) -> np.ndarray | None:
     """Return the largest contour by area from a binary mask."""
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -192,6 +398,10 @@ def largest_contour(mask: np.ndarray) -> np.ndarray | None:
         return None
     return max(contours, key=cv2.contourArea)
 
+
+# ---------------------------------------------------------------------------
+# Quad extraction
+# ---------------------------------------------------------------------------
 
 def approx_to_quad(contour: np.ndarray) -> np.ndarray | None:
     """
@@ -203,7 +413,6 @@ def approx_to_quad(contour: np.ndarray) -> np.ndarray | None:
     if peri < 20:
         return None
 
-    # Binary search for the epsilon that gives 4 points.
     lo, hi = 0.005, 0.15
     best_approx: np.ndarray | None = None
     best_diff = 999
@@ -223,11 +432,10 @@ def approx_to_quad(contour: np.ndarray) -> np.ndarray | None:
         else:
             return approx.reshape(-1, 2).astype(np.int32)
 
-    # Accept 4-6 point results and reduce to 4 by dropping shortest edges.
+    # Accept 4-6 point results and reduce to 4 by dropping least-area vertex.
     if best_approx is not None and 4 <= len(best_approx) <= 6:
         pts = best_approx.reshape(-1, 2).astype(np.float32)
         while len(pts) > 4:
-            # Remove the vertex whose removal changes area least.
             min_loss = float("inf")
             drop_idx = 0
             for i in range(len(pts)):
@@ -249,40 +457,34 @@ def approx_to_quad(contour: np.ndarray) -> np.ndarray | None:
 def order_quad_points(pts: np.ndarray) -> np.ndarray:
     """
     Order 4 points as: top-left, top-right, bottom-right, bottom-left.
-    This is the standard ordering for homography source points.
+    Standard ordering for homography source points.
     """
     pts = pts.astype(np.float32)
-    # Sort by y first to split top vs bottom.
     sorted_by_y = pts[np.argsort(pts[:, 1])]
     top = sorted_by_y[:2]
     bottom = sorted_by_y[2:]
-    # Within top, left has smaller x.
     tl, tr = top[np.argsort(top[:, 0])]
     bl, br = bottom[np.argsort(bottom[:, 0])]
     return np.array([tl, tr, br, bl], dtype=np.int32)
 
 
-def hough_quad_fallback(
-    mask: np.ndarray,
-    contour: np.ndarray,
-) -> np.ndarray | None:
+def hough_quad_fallback(mask: np.ndarray, contour: np.ndarray) -> np.ndarray | None:
     """
-    Fallback: draw the convex hull edges, run HoughLines, take the 4 strongest
-    non-duplicate lines, and intersect them for corners.
+    [Improvement 6] Fallback: run Canny on the actual cleaned mask edges
+    (not the synthetic hull drawing), then HoughLines to find the 4 dominant
+    lines and intersect them for corners.
     """
-    hull = cv2.convexHull(contour)
     h, w = mask.shape
 
-    # Draw hull edges as a thin edge image for Hough.
-    edge_img = np.zeros((h, w), dtype=np.uint8)
-    cv2.drawContours(edge_img, [hull], 0, 255, 2)
+    # Canny on the real mask boundary — picks up the actual edge shape.
+    edges = cv2.Canny(mask * 255, 50, 150)
 
     min_dim = min(h, w)
-    lines = cv2.HoughLines(edge_img, rho=1, theta=np.pi / 180, threshold=max(30, min_dim // 8))
+    lines = cv2.HoughLines(edges, rho=1, theta=np.pi / 180, threshold=max(30, min_dim // 8))
     if lines is None or len(lines) < 4:
         return None
 
-    # De-duplicate lines by (rho, theta) proximity.
+    # De-duplicate by (rho, theta) proximity.
     unique: List[tuple[float, float]] = []
     for line in lines:
         rho, theta = float(line[0][0]), float(line[0][1])
@@ -299,8 +501,9 @@ def hough_quad_fallback(
     if len(unique) < 4:
         return None
 
-    # Intersect all pairs, keep points inside the image.
-    def line_intersect(r1: float, t1: float, r2: float, t2: float) -> tuple[float, float] | None:
+    def _line_intersect(
+        r1: float, t1: float, r2: float, t2: float,
+    ) -> tuple[float, float] | None:
         det = np.cos(t1) * np.sin(t2) - np.cos(t2) * np.sin(t1)
         if abs(det) < 1e-6:
             return None
@@ -311,25 +514,22 @@ def hough_quad_fallback(
     corners: List[tuple[float, float]] = []
     for i in range(4):
         for j in range(i + 1, 4):
-            pt = line_intersect(unique[i][0], unique[i][1], unique[j][0], unique[j][1])
+            pt = _line_intersect(unique[i][0], unique[i][1], unique[j][0], unique[j][1])
             if pt and 0 <= pt[0] < w and 0 <= pt[1] < h:
                 corners.append(pt)
 
     if len(corners) < 4:
         return None
 
-    # Pick the 4 corners closest to the convex hull centroid spread.
     corners_np = np.array(corners, dtype=np.float32)
-    M = cv2.moments(hull)
+    M = cv2.moments(cv2.convexHull(contour))
     if M["m00"] == 0:
         return None
-    cx, cy = M["m10"] / M["m00"], M["m01"] / M["m00"]
-    dists = np.sqrt((corners_np[:, 0] - cx) ** 2 + (corners_np[:, 1] - cy) ** 2)
-    # Take 4 most spread-out corners by sorting by angle from centroid.
+    cx = M["m10"] / M["m00"]
+    cy = M["m01"] / M["m00"]
     angles = np.arctan2(corners_np[:, 1] - cy, corners_np[:, 0] - cx)
     sorted_idx = np.argsort(angles)
     if len(sorted_idx) >= 4:
-        # Take 4 roughly evenly spaced by angle.
         step = len(sorted_idx) / 4.0
         picks = [sorted_idx[int(i * step)] for i in range(4)]
         return corners_np[picks].astype(np.int32)
@@ -337,11 +537,159 @@ def hough_quad_fallback(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Edge refinement from raw image
+# ---------------------------------------------------------------------------
+
+def refine_sides_from_image(
+    frame_bgr: np.ndarray,
+    quad: np.ndarray,
+    mask: np.ndarray,
+) -> np.ndarray:
+    """
+    [Improvement 2] Use Canny + HoughLinesP on the raw BGR frame in a narrow
+    strip along each side edge of the quad. The gutter boundaries are
+    high-contrast edges in the raw image and give much sharper side-line
+    estimates than anything derived from the mask alone.
+    """
+    h, w = frame_bgr.shape[:2]
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 1.5)
+    edges = cv2.Canny(blurred, 50, 150)
+
+    refined = quad.copy().astype(np.float32)
+
+    # Side edges: TL→BL (left), TR→BR (right).
+    sides = [(0, 3), (1, 2)]
+
+    for top_idx, bot_idx in sides:
+        pt_top = refined[top_idx]
+        pt_bot = refined[bot_idx]
+
+        dx = pt_bot[0] - pt_top[0]
+        dy = pt_bot[1] - pt_top[1]
+        length = np.sqrt(dx ** 2 + dy ** 2)
+        if length < 20:
+            continue
+
+        # Perpendicular direction.
+        nx, ny = -dy / length, dx / length
+        strip_width = 25.0
+
+        # Build a strip polygon around the side edge.
+        offset = np.array([nx, ny], dtype=np.float32) * strip_width
+        strip_poly = np.array(
+            [pt_top + offset, pt_top - offset, pt_bot - offset, pt_bot + offset],
+            dtype=np.int32,
+        )
+
+        strip_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(strip_mask, [strip_poly], 255)
+        strip_edges = cv2.bitwise_and(edges, strip_mask)
+
+        min_line_len = max(int(length * 0.25), 30)
+        lines = cv2.HoughLinesP(
+            strip_edges, 1, np.pi / 180,
+            threshold=30, minLineLength=min_line_len, maxLineGap=20,
+        )
+        if lines is None or len(lines) == 0:
+            continue
+
+        # Pick the longest near-vertical segment.
+        best_line = None
+        best_len = 0.0
+        for seg in lines:
+            sx1, sy1, sx2, sy2 = seg[0]
+            sdx, sdy = abs(sx2 - sx1), abs(sy2 - sy1)
+            if sdy < sdx:
+                continue  # skip more-horizontal lines
+            seg_len = np.sqrt(float(sdx ** 2 + sdy ** 2))
+            if seg_len > best_len:
+                best_len = seg_len
+                best_line = seg[0]
+
+        if best_line is None:
+            continue
+
+        lx1, ly1, lx2, ly2 = best_line
+        if abs(ly2 - ly1) < 1:
+            continue
+
+        # Fit x = a*y + b and extrapolate to quad top/bottom y.
+        a = (lx2 - lx1) / (ly2 - ly1)
+        b = lx1 - a * ly1
+
+        new_top_x = a * refined[top_idx, 1] + b
+        new_bot_x = a * refined[bot_idx, 1] + b
+
+        if abs(new_top_x - refined[top_idx, 0]) < strip_width:
+            refined[top_idx, 0] = new_top_x
+        if abs(new_bot_x - refined[bot_idx, 0]) < strip_width:
+            refined[bot_idx, 0] = new_bot_x
+
+    refined[:, 0] = np.clip(refined[:, 0], 0, w - 1)
+    refined[:, 1] = np.clip(refined[:, 1], 0, h - 1)
+    return refined.astype(np.int32)
+
+
+# ---------------------------------------------------------------------------
+# Geometric validation
+# ---------------------------------------------------------------------------
+
+def validate_vanishing_point(
+    quad: np.ndarray,
+    img_shape_hw: tuple[int, int],
+) -> bool:
+    """
+    [Improvement 4] Check that the two side edges (TL→BL and TR→BR) converge
+    toward a vanishing point that is above the image and roughly centered
+    horizontally. This enforces perspective geometry — parallel lane edges
+    must converge upward in a camera view.
+    """
+    h, w = img_shape_hw
+    q = quad.astype(np.float64)
+    tl, tr, br, bl = q[0], q[1], q[2], q[3]
+
+    # Left side direction: TL → BL (downward in image).
+    left_dx = bl[0] - tl[0]
+    left_dy = bl[1] - tl[1]
+    # Right side direction: TR → BR (downward in image).
+    right_dx = br[0] - tr[0]
+    right_dy = br[1] - tr[1]
+
+    # Intersect the two side lines (extended upward).
+    # Line 1: tl + t * (left_dx, left_dy)
+    # Line 2: tr + s * (right_dx, right_dy)
+    det = left_dx * right_dy - right_dx * left_dy
+    if abs(det) < 1e-6:
+        # Parallel sides — acceptable for a far-away view.
+        return True
+
+    t = ((tr[0] - tl[0]) * right_dy - (tr[1] - tl[1]) * right_dx) / det
+    vp_x = tl[0] + t * left_dx
+    vp_y = tl[1] + t * left_dy
+
+    # Vanishing point should be above the image (negative t means upward from TL).
+    if vp_y > tl[1]:
+        return False
+
+    # Should be roughly centered — not wildly off to one side.
+    if vp_x < -w or vp_x > 2 * w:
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+
 def evaluate_trapezoid(
     lane_mask: np.ndarray,
     polygon: np.ndarray,
     *,
-    score_coverage_weight: float = 0.65,
+    score_coverage_weight: float = 0.55,
+    score_geometry_weight: float = 0.15,
 ) -> tuple[float, float, float]:
     lane_area = float(np.count_nonzero(lane_mask))
     if lane_area <= 0:
@@ -356,22 +704,48 @@ def evaluate_trapezoid(
     intersection = float(np.count_nonzero((trap_mask > 0) & (lane_mask > 0)))
     coverage = intersection / lane_area
     purity = intersection / trap_area
-    score = score_coverage_weight * coverage + (1.0 - score_coverage_weight) * purity
+
+    # Geometric quality: reward when bottom is wider than top (perspective)
+    # and sides are roughly symmetric.
+    q = polygon.astype(np.float64)
+    width_top = abs(q[1, 0] - q[0, 0])
+    width_bot = abs(q[2, 0] - q[3, 0])
+    center_top = (q[0, 0] + q[1, 0]) / 2.0
+    center_bot = (q[2, 0] + q[3, 0]) / 2.0
+
+    # Taper ratio: ideal ~0.3-0.6 for bowling lane perspective.
+    taper = width_top / max(width_bot, 1.0)
+    taper_score = 1.0 - min(abs(taper - 0.45) / 0.45, 1.0)
+
+    # Symmetry: top and bottom centers should be close horizontally.
+    center_shift = abs(center_top - center_bot) / max(width_bot, 1.0)
+    symmetry_score = max(0.0, 1.0 - center_shift * 2.0)
+
+    geometry = 0.5 * taper_score + 0.5 * symmetry_score
+
+    overlap_weight = 1.0 - score_coverage_weight - score_geometry_weight
+    score = (
+        score_coverage_weight * coverage
+        + overlap_weight * purity
+        + score_geometry_weight * geometry
+    )
     return coverage, purity, score
 
+
+# ---------------------------------------------------------------------------
+# Pins anchoring
+# ---------------------------------------------------------------------------
 
 def find_nearest_pins_box(
     lane_mask: np.ndarray,
     pins_boxes: List[np.ndarray],
 ) -> np.ndarray | None:
     """
-    Find the pins bbox whose bottom-center is closest to (or overlapping with)
-    the top region of the lane mask. Pins mark where the lane ends (far end).
+    Find the pins bbox whose center-x is closest to the lane mask centroid-x.
     """
     if not pins_boxes:
         return None
 
-    # Get the centroid x of the lane mask.
     ys, xs = np.where(lane_mask > 0)
     if len(xs) == 0:
         return None
@@ -380,9 +754,7 @@ def find_nearest_pins_box(
     best_box = None
     best_dist = float("inf")
     for box in pins_boxes:
-        # box is [x1, y1, x2, y2]
         pins_cx = (box[0] + box[2]) / 2.0
-        pins_bot_y = box[3]
         dist = abs(pins_cx - lane_cx)
         if dist < best_dist:
             best_dist = dist
@@ -391,17 +763,34 @@ def find_nearest_pins_box(
     return best_box
 
 
+# ---------------------------------------------------------------------------
+# Core: build lane trapezoid
+# ---------------------------------------------------------------------------
+
 def build_lane_trapezoid(
     lane_mask: np.ndarray,
+    *,
+    frame_bgr: np.ndarray | None = None,
     pins_boxes: List[np.ndarray] | None = None,
 ) -> TrapezoidCandidate | None:
     """
     Extract a clean 4-point trapezoid from a single lane mask.
-    Strategy: clean mask → convex hull → approxPolyDP to 4 pts → fallback to Hough.
-    If pins_boxes provided, use the nearest pins detection to anchor the top edge
-    (the far/narrow end of the lane).
+
+    Pipeline:
+      1. Morph cleanup (close+open)
+      2. [Imp 5] Connected-component isolation → largest blob only
+      3. Convex hull → adaptive approxPolyDP to 4 pts
+      4. [Imp 6] Fallback: Canny on mask edges → Hough
+      5. Order as TL, TR, BR, BL
+      6. [Imp 3] Pins anchoring (both x and y)
+      7. [Imp 2] Refine side edges from raw image
+      8. [Imp 4] Vanishing-point validation
+      9. Score with geometric priors
     """
     cleaned = clean_mask(lane_mask)
+
+    # [Improvement 5] Isolate the single largest connected component.
+    cleaned = keep_largest_component(cleaned)
 
     contour = largest_contour(cleaned)
     if contour is None or cv2.contourArea(contour) < 500:
@@ -410,7 +799,7 @@ def build_lane_trapezoid(
     # Primary: adaptive approxPolyDP on convex hull.
     quad = approx_to_quad(contour)
 
-    # Fallback: Hough lines on hull edges.
+    # [Improvement 6] Fallback: Canny on real mask edges → Hough.
     if quad is None:
         quad = hough_quad_fallback(cleaned, contour)
 
@@ -419,20 +808,39 @@ def build_lane_trapezoid(
 
     quad = order_quad_points(quad)
 
-    # If we have a nearby pins box, snap the top edge y to the pins bottom.
-    # The pins sit right at the end of the lane, so their bottom y is the lane's
-    # far boundary — use it to anchor the top two points of the trapezoid.
+    # [Improvement 3] Pins anchoring — use both y AND x from the pins box.
     if pins_boxes:
         pins_box = find_nearest_pins_box(lane_mask, pins_boxes)
         if pins_box is not None:
             pins_bot_y = int(pins_box[3])
-            # Only adjust if the pins are near the top of the current quad.
+            pins_cx = float(pins_box[0] + pins_box[2]) / 2.0
+            pins_half_w = float(pins_box[2] - pins_box[0]) / 2.0
             current_top_y = int(min(quad[0, 1], quad[1, 1]))
+
             if abs(pins_bot_y - current_top_y) < lane_mask.shape[0] * 0.3:
                 quad[0, 1] = pins_bot_y
                 quad[1, 1] = pins_bot_y
 
-    # Validate: bottom should be wider than top (perspective trapezoid).
+                # Lane is ~1.7x wider than pin deck at the pin line.
+                lane_half_at_pins = pins_half_w * 1.7
+                proposed_tl_x = pins_cx - lane_half_at_pins
+                proposed_tr_x = pins_cx + lane_half_at_pins
+
+                # Only apply if the adjustment is reasonable.
+                if abs(proposed_tl_x - quad[0, 0]) < 50:
+                    quad[0, 0] = int(proposed_tl_x)
+                if abs(proposed_tr_x - quad[1, 0]) < 50:
+                    quad[1, 0] = int(proposed_tr_x)
+
+    # [Improvement 2] Refine side edges using gutter edges in the raw image.
+    if frame_bgr is not None:
+        quad = refine_sides_from_image(frame_bgr, quad, cleaned)
+
+    # [Improvement 4] Reject quads that don't form a valid perspective trapezoid.
+    if not validate_vanishing_point(quad, lane_mask.shape):
+        return None
+
+    # Basic size validation.
     width_top = abs(int(quad[1, 0]) - int(quad[0, 0]))
     width_bottom = abs(int(quad[2, 0]) - int(quad[3, 0]))
     if width_top < 4 or width_bottom < 8:
@@ -451,6 +859,10 @@ def build_lane_trapezoid(
         y_bottom=y_bottom,
     )
 
+
+# ---------------------------------------------------------------------------
+# Detection extraction
+# ---------------------------------------------------------------------------
 
 def extract_lane_and_pins_data(
     result: Any,
@@ -489,64 +901,9 @@ def extract_lane_and_pins_data(
     return lane_masks, pins_boxes
 
 
-TRAPEZOID_COLORS = [
-    (0, 255, 255),   # cyan
-    (255, 0, 255),   # magenta
-    (0, 165, 255),   # orange
-    (255, 255, 0),   # yellow-ish
-    (0, 255, 128),   # spring green
-]
-
-
-def draw_trapezoid_debug(
-    image: np.ndarray,
-    trapezoid: TrapezoidCandidate,
-    *,
-    lane_index: int = 0,
-    color: tuple[int, int, int] | None = None,
-) -> None:
-    if color is None:
-        color = TRAPEZOID_COLORS[lane_index % len(TRAPEZOID_COLORS)]
-
-    poly = trapezoid.polygon.reshape((-1, 1, 2))
-
-    # Semi-transparent fill so you can see the trapezoid region clearly.
-    fill_overlay = image.copy()
-    cv2.fillPoly(fill_overlay, [trapezoid.polygon.reshape((-1, 1, 2))], color)
-    cv2.addWeighted(fill_overlay, 0.2, image, 0.8, 0, dst=image)
-
-    # Thick outline.
-    cv2.polylines(image, [poly], True, color, 3, cv2.LINE_AA)
-
-    # Draw corner points as circles for easy inspection.
-    for pt_idx in range(4):
-        pt = tuple(trapezoid.polygon[pt_idx].tolist())
-        cv2.circle(image, pt, 6, color, -1, cv2.LINE_AA)
-        cv2.circle(image, pt, 6, (0, 0, 0), 1, cv2.LINE_AA)
-        # Label corners: TL=0, TR=1, BR=2, BL=3
-        corner_labels = ["TL", "TR", "BR", "BL"]
-        cv2.putText(
-            image, corner_labels[pt_idx],
-            (pt[0] + 8, pt[1] - 4),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA,
-        )
-
-    tl = tuple(trapezoid.polygon[0].tolist())
-    text = (
-        f"lane{lane_index} s={trapezoid.score:.2f} "
-        f"c={trapezoid.coverage:.2f} p={trapezoid.purity:.2f}"
-    )
-    cv2.putText(
-        image,
-        text,
-        (int(tl[0]), max(24, int(tl[1]) - 12)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        color,
-        2,
-        cv2.LINE_AA,
-    )
-
+# ---------------------------------------------------------------------------
+# Frame overlay
+# ---------------------------------------------------------------------------
 
 def overlay_result_on_frame(
     frame_bgr: np.ndarray,
@@ -557,6 +914,8 @@ def overlay_result_on_frame(
     lane_class_id: int = 1,
     enable_guided_trapezoid: bool = True,
     min_trapezoid_score: float = 0.20,
+    smoother: TemporalSmoother | None = None,
+    frame_idx: int = 0,
 ) -> np.ndarray:
     """
     Overlay segmentation masks + boxes + labels for one result onto one frame.
@@ -600,14 +959,8 @@ def overlay_result_on_frame(
         ty = y1 - 8 if y1 - 8 > th else y1 + th + 8
         cv2.rectangle(output, (x1, ty - th - 6), (x1 + tw + 6, ty + 2), color, -1)
         cv2.putText(
-            output,
-            label,
-            (x1 + 3, ty - 2),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
+            output, label, (x1 + 3, ty - 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA,
         )
 
     cv2.addWeighted(overlay, alpha, output, 1.0 - alpha, 0.0, dst=output)
@@ -620,13 +973,32 @@ def overlay_result_on_frame(
             pins_class_id=pins_class_id,
             frame_shape_hw=(h, w),
         )
-        for lane_idx, lmask in enumerate(lane_masks):
-            trapezoid = build_lane_trapezoid(lmask, pins_boxes=pins_boxes)
-            if trapezoid is not None and trapezoid.score >= min_trapezoid_score:
-                draw_trapezoid_debug(output, trapezoid, lane_index=lane_idx)
+
+        candidates: List[TrapezoidCandidate] = []
+        for lmask in lane_masks:
+            trap = build_lane_trapezoid(
+                lmask,
+                frame_bgr=frame_bgr,
+                pins_boxes=pins_boxes,
+            )
+            if trap is not None and trap.score >= min_trapezoid_score:
+                candidates.append(trap)
+
+        # [Improvement 1] Temporal smoothing.
+        if smoother is not None and candidates:
+            candidates = smoother.update(candidates, frame_idx)
+
+        for lane_idx, cand in enumerate(candidates):
+            draw_trapezoid_debug(
+                output, cand, lane_index=lane_idx, frame_idx=frame_idx,
+            )
 
     return output
 
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
 
 def run_overlay_generation(
     *,
@@ -662,9 +1034,13 @@ def run_overlay_generation(
     if not writer.isOpened():
         raise RuntimeError(f"Failed to open video writer for: {output_path}")
 
+    smoother = TemporalSmoother() if enable_guided_trapezoid else None
+
     try:
         frames = split_video.frames
         total = len(frames)
+        global_frame_idx = 0
+
         for start in range(0, total, batch_size):
             end = min(start + batch_size, total)
             batch_frames = frames[start:end]
@@ -691,15 +1067,24 @@ def run_overlay_generation(
                     lane_class_id=lane_class_id,
                     enable_guided_trapezoid=enable_guided_trapezoid,
                     min_trapezoid_score=min_trapezoid_score,
+                    smoother=smoother,
+                    frame_idx=global_frame_idx,
                 )
                 writer.write(overlay)
+                global_frame_idx += 1
 
             print(f"Processed frames {start}..{end - 1} / {total - 1}")
     finally:
         writer.release()
 
-    print(f"Overlay video saved to: {output_path}")
+    print(f"\nOverlay video saved to: {output_path}")
+    if smoother is not None:
+        print(f"Temporal tracking summary:\n{smoother.summary()}")
 
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
