@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from core.InferenceEngine.LaneBallInference import LaneBallInference
+from core.InferenceEngine.Sam3DBodyInference import Sam3DBodyInference
 from core.LaneBalls.Kinematics import compute_kinematics_per_quarter
 from core.LaneBalls.Postprocessing import run_lane_ball_postprocessing
 from core.LaneBalls.Preprocessing import extract_frame_segmentation
@@ -22,10 +23,11 @@ class InferenceEngine:
     """
     Inference orchestrator.
 
-    Manages the YOLO segmentation model (ball / lane / pins) on a single GPU.
-    SAM 3D Body is temporarily disabled while gated checkpoint access is pending.
+    Manages the YOLO segmentation model (ball / lane / pins) and
+    SAM 3D Body (skeleton estimation) on a single GPU.
 
     Call `forward()` to run YOLO segmentation on the first RGB frame.
+    Call `forward_sam3d_body()` to run 3D skeleton estimation on a list of frames.
     """
 
     def __init__(self) -> None:
@@ -36,14 +38,15 @@ class InferenceEngine:
 
         # ── Load active models ────────────────────────────────────────────────
         self.lane_ball = LaneBallInference(device=str(self.device))
-        # TEMPORARILY DISABLED:
-        # self.sam3d_body = Sam3DBodyInference(device=str(self.device))
+        self.sam3d_body = Sam3DBodyInference(device=str(self.device))
 
         # Thread pool for running sync model inference in async context.
-        # Keep 2 workers for parity with earlier dual-model setup.
+        # Keep 2 workers so both models can run concurrently.
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="inference")
 
-        logger.info("InferenceEngine ready — LaneBall model loaded on %s", self.device)
+        logger.info(
+            "InferenceEngine ready — LaneBall + SAM3D Body loaded on %s", self.device
+        )
 
     # ── Async forward pass ────────────────────────────────────────────────────
 
@@ -104,6 +107,52 @@ class InferenceEngine:
             float(fps),
             int(start_frame),
         )
+
+    async def forward_sam3d_body(
+        self,
+        frames_rgb: list[np.ndarray],
+    ) -> list[list[dict[str, Any]]]:
+        """
+        Run SAM 3D Body skeleton estimation on every frame.
+
+        Returns:
+            List (one entry per frame) of lists (one entry per detected person)
+            of dicts with keys: joint_id (int), x/y/z (float).
+        """
+        if not frames_rgb:
+            return []
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            self._run_sam3d_body_sync,
+            frames_rgb,
+        )
+
+    def _run_sam3d_body_sync(
+        self, frames_rgb: list[np.ndarray]
+    ) -> list[list[dict[str, Any]]]:
+        all_frames: list[list[dict[str, Any]]] = []
+
+        for idx, frame in enumerate(frames_rgb):
+            skeletons = self.sam3d_body.frame_to_skeletons(frame)
+            frame_joints: list[dict[str, Any]] = []
+            for skeleton in skeletons:
+                for joint in skeleton.joints:
+                    frame_joints.append(
+                        {
+                            "joint_id": joint.joint_id,
+                            "x": joint.x,
+                            "y": joint.y,
+                            "z": joint.z,
+                        }
+                    )
+            all_frames.append(frame_joints)
+            if (idx + 1) % 50 == 0:
+                logger.info("SAM3D Body: processed %d / %d frames", idx + 1, len(frames_rgb))
+
+        logger.info("SAM3D Body: finished all %d frames", len(frames_rgb))
+        return all_frames
 
     # ── Internal: YOLO seg on the first frame only ────────────────────────────
 

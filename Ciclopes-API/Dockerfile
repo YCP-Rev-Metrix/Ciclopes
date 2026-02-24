@@ -22,6 +22,8 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip && \
     pip install -r /app/requirements.txt && \
+    # termcolor is required by the DINOv3 backbone (pulled via torch.hub)
+    pip install termcolor && \
     # Force nightly PyTorch for RTX 5070 Ti (sm_120) support
     pip install --upgrade --force-reinstall \
         --extra-index-url https://download.pytorch.org/whl/nightly/cu124 \

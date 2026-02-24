@@ -14,6 +14,7 @@ class BallPoint(BaseModel):
 
 
 class SkeletonPoint(BaseModel):
+    joint_id: int = Field(..., description="MHR70 joint index (0-69), used as rendering index for skeleton links")
     x: float
     y: float
     z: float

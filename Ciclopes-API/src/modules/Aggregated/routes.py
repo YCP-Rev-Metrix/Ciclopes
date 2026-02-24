@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import cv2
 from fastapi import APIRouter, HTTPException, Request
 
-from src.modules.Aggregated.models import AggRunInput, AggRunOutput, BallPoint, KinematicsRow
+from src.modules.Aggregated.models import AggRunInput, AggRunOutput, BallPoint, KinematicsRow, SkeletonPoint
 
 logger = logging.getLogger("ciclopes.aggregated_routes")
 HARDCODED_START_FRAME = 120
@@ -72,16 +73,23 @@ async def run_aggregate_pipeline(request: Request, payload: AggRunInput):
     fps = float(split_video.fps) if split_video.fps > 0 else 30.0
     rgb_frames = [cv2.cvtColor(vf.image, cv2.COLOR_BGR2RGB) for vf in split_video.frames]
 
+    # Run both pipelines concurrently — they use separate thread-pool slots.
+    lane_ball_coro = engine.forward_lane_ball(
+        frames_rgb=rgb_frames,
+        fps=fps,
+        start_frame=HARDCODED_START_FRAME,
+    )
+    sam3d_coro = engine.forward_sam3d_body(frames_rgb=rgb_frames)
+
     try:
-        lane_ball_output = await engine.forward_lane_ball(
-            frames_rgb=rgb_frames,
-            fps=fps,
-            start_frame=HARDCODED_START_FRAME,
+        lane_ball_output, sam3d_output = await asyncio.gather(
+            lane_ball_coro, sam3d_coro
         )
     except Exception as exc:
-        logger.exception("/agg/run lane-ball pipeline failed")
-        raise HTTPException(status_code=500, detail=f"LaneBall pipeline error: {exc}")
+        logger.exception("/agg/run pipeline failed")
+        raise HTTPException(status_code=500, detail=f"Pipeline error: {exc}")
 
+    # ── Lane-ball results ──────────────────────────────────────────────────
     health = lane_ball_output.get("health", {})
     pipeline_error = health.get("error")
     if pipeline_error:
@@ -107,8 +115,23 @@ async def run_aggregate_pipeline(request: Request, payload: AggRunInput):
         for row in quarters
     ]
 
+    # ── SAM3D Body results ─────────────────────────────────────────────────
+    # sam3d_output: list[list[dict]] — outer=frames, inner=joints per frame
+    skeleton_points = [
+        [
+            SkeletonPoint(
+                joint_id=int(j["joint_id"]),
+                x=float(j["x"]),
+                y=float(j["y"]),
+                z=float(j["z"]),
+            )
+            for j in frame_joints
+        ]
+        for frame_joints in sam3d_output
+    ]
+
     return AggRunOutput(
         ball_points=ball_points,
         kinematics_table=kinematics_table,
-        skeleton_points=[],
+        skeleton_points=skeleton_points,
     )
