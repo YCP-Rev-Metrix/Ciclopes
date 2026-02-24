@@ -6,6 +6,7 @@ import uvicorn
 
 from core.InferenceEngine.InferenceEngine import InferenceEngine
 from src.modules.router import router as api_router
+from src.settings import load_app_settings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ciclopes.main")
@@ -18,6 +19,7 @@ async def lifespan(app: FastAPI):
     Shutdown: release resources
     """
     logger.info("Loading inference models — this may take a moment on first run...")
+    app.state.settings = load_app_settings()
     app.state.inference_engine = InferenceEngine()
     logger.info("InferenceEngine ready: %s", app.state.inference_engine.status())
     yield

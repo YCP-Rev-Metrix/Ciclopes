@@ -131,6 +131,9 @@ class InferenceEngine:
                 segmentations_by_frame=segmentations_by_frame,
                 fps=fps,
                 start_frame=start_frame,
+                frames_bgr=[
+                    np.ascontiguousarray(frame[:, :, ::-1]) for frame in frames_rgb
+                ],
             )
         except Exception as exc:
             post_ms = (time.perf_counter() - post_t0) * 1000.0

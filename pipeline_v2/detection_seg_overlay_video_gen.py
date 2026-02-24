@@ -49,6 +49,9 @@ class TrackedLane:
     best_score: float
     best_quad: np.ndarray
     best_frame_idx: int
+    ball_votes: int = 0
+    total_mask_area: float = 0.0
+    seen_count: int = 0
 
 
 class TemporalSmoother:
@@ -76,11 +79,15 @@ class TemporalSmoother:
         self,
         candidates: List[TrapezoidCandidate],
         frame_idx: int,
+        ball_boxes: List[np.ndarray] | None = None,
+        lane_mask_areas: List[float] | None = None,
     ) -> List[TrapezoidCandidate]:
         used_tracks: set[int] = set()
         smoothed: List[TrapezoidCandidate] = []
+        # Map candidate index → track index for ball association.
+        cand_to_track: List[int] = []
 
-        for cand in candidates:
+        for ci, cand in enumerate(candidates):
             cx = float(np.mean(cand.polygon[:, 0]))
 
             # Match to closest existing track.
@@ -117,6 +124,9 @@ class TemporalSmoother:
 
                 track.centroid_x = float(np.mean(track.quad[:, 0]))
                 track.last_seen_frame = frame_idx
+                track.seen_count += 1
+                if lane_mask_areas and ci < len(lane_mask_areas):
+                    track.total_mask_area += lane_mask_areas[ci]
                 if cand.score > track.best_score:
                     track.best_score = cand.score
                     track.best_quad = cand.polygon.copy()
@@ -132,8 +142,13 @@ class TemporalSmoother:
                         y_bottom=int(np.max(track.quad[:, 1])),
                     )
                 )
+                cand_to_track.append(best_ti)
             else:
                 # New track.
+                area = 0.0
+                if lane_mask_areas and ci < len(lane_mask_areas):
+                    area = lane_mask_areas[ci]
+                new_idx = len(self.tracks)
                 self.tracks.append(
                     TrackedLane(
                         quad=cand.polygon.copy(),
@@ -142,9 +157,33 @@ class TemporalSmoother:
                         best_score=cand.score,
                         best_quad=cand.polygon.copy(),
                         best_frame_idx=frame_idx,
+                        ball_votes=0,
+                        total_mask_area=area,
+                        seen_count=1,
                     )
                 )
                 smoothed.append(cand)
+                cand_to_track.append(new_idx)
+
+        # Associate balls with lane tracks.
+        if ball_boxes:
+            for ball_box in ball_boxes:
+                ball_cx = float(ball_box[0] + ball_box[2]) / 2.0
+                ball_cy = float(ball_box[1] + ball_box[3]) / 2.0
+                ball_pt = np.array([ball_cx, ball_cy], dtype=np.float32)
+
+                for ci, cand in enumerate(candidates):
+                    if ci < len(cand_to_track):
+                        ti = cand_to_track[ci]
+                        if ti < len(self.tracks):
+                            dist = cv2.pointPolygonTest(
+                                cand.polygon.reshape((-1, 1, 2)).astype(np.float32),
+                                (ball_cx, ball_cy),
+                                measureDist=False,
+                            )
+                            if dist >= 0:
+                                self.tracks[ti].ball_votes += 1
+                                break  # one ball → one lane
 
         # Expire stale tracks.
         self.tracks = [
@@ -152,12 +191,35 @@ class TemporalSmoother:
         ]
         return smoothed
 
+    def select_active_lane(self) -> TrackedLane | None:
+        """
+        Pick the active (bowler's) lane. Priority:
+        1. Lane with the most ball votes (ball was detected inside it).
+        2. Fallback: lane with the largest average mask area (closest to camera).
+        """
+        if not self.tracks:
+            return None
+
+        # Any tracks with ball votes?
+        tracks_with_balls = [t for t in self.tracks if t.ball_votes > 0]
+        if tracks_with_balls:
+            return max(tracks_with_balls, key=lambda t: t.ball_votes)
+
+        # Fallback: largest average mask area = closest/most prominent lane.
+        return max(
+            self.tracks,
+            key=lambda t: t.total_mask_area / max(t.seen_count, 1),
+        )
+
     def summary(self) -> str:
         parts: List[str] = []
         for i, t in enumerate(self.tracks):
+            avg_area = t.total_mask_area / max(t.seen_count, 1)
             parts.append(
                 f"  lane track {i}: best_score={t.best_score:.3f} "
-                f"best_frame={t.best_frame_idx}"
+                f"best_frame={t.best_frame_idx} "
+                f"ball_votes={t.ball_votes} avg_area={avg_area:.0f} "
+                f"seen={t.seen_count}"
             )
         return "\n".join(parts) if parts else "  (no tracked lanes)"
 
@@ -864,20 +926,22 @@ def build_lane_trapezoid(
 # Detection extraction
 # ---------------------------------------------------------------------------
 
-def extract_lane_and_pins_data(
+def extract_detections(
     result: Any,
     lane_class_id: int,
     pins_class_id: int,
+    ball_class_id: int,
     frame_shape_hw: tuple[int, int],
-) -> tuple[List[np.ndarray], List[np.ndarray]]:
+) -> tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
     """
-    Extract all lane instance masks and all pins bounding boxes from a result.
-    Returns (lane_masks, pins_boxes_xyxy).
+    Extract all lane instance masks, pins bounding boxes, and ball bounding
+    boxes from a result.
+    Returns (lane_masks, pins_boxes_xyxy, ball_boxes_xyxy).
     """
     boxes = getattr(result, "boxes", None)
     masks = getattr(result, "masks", None)
     if boxes is None or masks is None or getattr(masks, "data", None) is None:
-        return [], []
+        return [], [], []
 
     cls_ids = boxes.cls.detach().cpu().numpy().astype(int)
     mask_arr = masks.data.detach().cpu().numpy()
@@ -886,6 +950,7 @@ def extract_lane_and_pins_data(
 
     lane_masks: List[np.ndarray] = []
     pins_boxes: List[np.ndarray] = []
+    ball_boxes: List[np.ndarray] = []
 
     for i, cls_id in enumerate(cls_ids):
         cid = int(cls_id)
@@ -897,29 +962,62 @@ def extract_lane_and_pins_data(
                 lane_masks.append(mask)
         elif cid == pins_class_id:
             pins_boxes.append(xyxy[i])
+        elif cid == ball_class_id:
+            ball_boxes.append(xyxy[i])
 
-    return lane_masks, pins_boxes
+    return lane_masks, pins_boxes, ball_boxes
 
 
 # ---------------------------------------------------------------------------
 # Frame overlay
 # ---------------------------------------------------------------------------
 
-def overlay_result_on_frame(
+def draw_chosen_lane(
+    image: np.ndarray,
+    quad: np.ndarray,
+    *,
+    best_frame_idx: int = 0,
+    best_score: float = 0.0,
+) -> None:
+    """Draw the chosen active-lane trapezoid persistently on every frame."""
+    color = (0, 255, 0)  # bright green — distinct from per-frame debug colors
+
+    # Semi-transparent fill.
+    fill = image.copy()
+    cv2.fillPoly(fill, [quad.reshape((-1, 1, 2))], color)
+    cv2.addWeighted(fill, 0.15, image, 0.85, 0, dst=image)
+
+    cv2.polylines(image, [quad.reshape((-1, 1, 2))], True, color, 3, cv2.LINE_AA)
+
+    corner_labels = ["TL", "TR", "BR", "BL"]
+    for i in range(4):
+        pt = tuple(quad[i].tolist())
+        cv2.circle(image, pt, 7, color, -1, cv2.LINE_AA)
+        cv2.circle(image, pt, 7, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(
+            image, corner_labels[i],
+            (pt[0] + 10, pt[1] - 6),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA,
+        )
+
+    # Label at top.
+    tl = tuple(quad[0].tolist())
+    text = f"ACTIVE LANE (from f{best_frame_idx}, s={best_score:.2f})"
+    cv2.putText(
+        image, text,
+        (int(tl[0]), max(20, int(tl[1]) - 16)),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA,
+    )
+
+
+def overlay_detections_on_frame(
     frame_bgr: np.ndarray,
     result: Any,
     class_names: Dict[int, str],
     *,
     alpha: float = 0.35,
-    lane_class_id: int = 1,
-    enable_guided_trapezoid: bool = True,
-    min_trapezoid_score: float = 0.20,
-    smoother: TemporalSmoother | None = None,
-    frame_idx: int = 0,
 ) -> np.ndarray:
-    """
-    Overlay segmentation masks + boxes + labels for one result onto one frame.
-    """
+    """Overlay segmentation masks + boxes + labels (no trapezoid logic)."""
     overlay = frame_bgr.copy()
     output = frame_bgr.copy()
 
@@ -964,35 +1062,6 @@ def overlay_result_on_frame(
         )
 
     cv2.addWeighted(overlay, alpha, output, 1.0 - alpha, 0.0, dst=output)
-
-    if enable_guided_trapezoid:
-        pins_class_id = 2
-        lane_masks, pins_boxes = extract_lane_and_pins_data(
-            result,
-            lane_class_id=lane_class_id,
-            pins_class_id=pins_class_id,
-            frame_shape_hw=(h, w),
-        )
-
-        candidates: List[TrapezoidCandidate] = []
-        for lmask in lane_masks:
-            trap = build_lane_trapezoid(
-                lmask,
-                frame_bgr=frame_bgr,
-                pins_boxes=pins_boxes,
-            )
-            if trap is not None and trap.score >= min_trapezoid_score:
-                candidates.append(trap)
-
-        # [Improvement 1] Temporal smoothing.
-        if smoother is not None and candidates:
-            candidates = smoother.update(candidates, frame_idx)
-
-        for lane_idx, cand in enumerate(candidates):
-            draw_trapezoid_debug(
-                output, cand, lane_index=lane_idx, frame_idx=frame_idx,
-            )
-
     return output
 
 
@@ -1025,6 +1094,91 @@ def run_overlay_generation(
         raise RuntimeError("No frames found in video.")
 
     fps = split_video.fps if split_video.fps > 0 else 30.0
+    frames = split_video.frames
+    total = len(frames)
+
+    # ---------------------------------------------------------------
+    # Pass 1: inference + trapezoid tracking + ball-lane association.
+    # Store results so we don't re-run inference in pass 2.
+    # ---------------------------------------------------------------
+    print("Pass 1: running inference and tracking lanes...")
+    smoother = TemporalSmoother() if enable_guided_trapezoid else None
+    ball_class_id = 0
+    pins_class_id = 2
+    all_results: List[Any] = []
+
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        batch_frames = frames[start:end]
+
+        batch_bgr = [vf.image for vf in batch_frames]
+        batch_rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in batch_bgr]
+
+        results = model.predict(
+            source=batch_rgb,
+            verbose=False,
+            imgsz=imgsz,
+            conf=conf,
+            iou=iou,
+            device=device,
+            retina_masks=True,
+        )
+
+        h, w = split_video.height, split_video.width
+        for fi, (frame_bgr, result) in enumerate(zip(batch_bgr, results)):
+            frame_idx = start + fi
+            all_results.append(result)
+
+            if smoother is not None and enable_guided_trapezoid:
+                lane_masks, pins_boxes, ball_boxes = extract_detections(
+                    result,
+                    lane_class_id=lane_class_id,
+                    pins_class_id=pins_class_id,
+                    ball_class_id=ball_class_id,
+                    frame_shape_hw=(h, w),
+                )
+
+                candidates: List[TrapezoidCandidate] = []
+                mask_areas: List[float] = []
+                for lmask in lane_masks:
+                    trap = build_lane_trapezoid(
+                        lmask, frame_bgr=frame_bgr, pins_boxes=pins_boxes,
+                    )
+                    if trap is not None and trap.score >= min_trapezoid_score:
+                        candidates.append(trap)
+                        mask_areas.append(float(np.count_nonzero(lmask)))
+
+                if candidates:
+                    smoother.update(
+                        candidates, frame_idx,
+                        ball_boxes=ball_boxes,
+                        lane_mask_areas=mask_areas,
+                    )
+
+        print(f"  inference {start}..{end - 1} / {total - 1}")
+
+    # Select active lane and its best trapezoid.
+    chosen_quad: np.ndarray | None = None
+    chosen_best_frame = 0
+    chosen_best_score = 0.0
+
+    if smoother is not None:
+        active = smoother.select_active_lane()
+        if active is not None:
+            chosen_quad = active.best_quad.copy()
+            chosen_best_frame = active.best_frame_idx
+            chosen_best_score = active.best_score
+            print(f"\nActive lane selected:")
+            print(f"  ball_votes={active.ball_votes}  "
+                  f"avg_area={active.total_mask_area / max(active.seen_count, 1):.0f}  "
+                  f"best_score={active.best_score:.3f}  "
+                  f"best_frame={active.best_frame_idx}")
+        print(f"\nAll lane tracks:\n{smoother.summary()}")
+
+    # ---------------------------------------------------------------
+    # Pass 2: render overlay video with chosen lane on every frame.
+    # ---------------------------------------------------------------
+    print(f"\nPass 2: rendering output video...")
     writer = cv2.VideoWriter(
         str(output_path),
         cv2.VideoWriter_fourcc(*"mp4v"),
@@ -1034,52 +1188,30 @@ def run_overlay_generation(
     if not writer.isOpened():
         raise RuntimeError(f"Failed to open video writer for: {output_path}")
 
-    smoother = TemporalSmoother() if enable_guided_trapezoid else None
-
     try:
-        frames = split_video.frames
-        total = len(frames)
-        global_frame_idx = 0
+        for fi in range(total):
+            frame_bgr = frames[fi].image
+            result = all_results[fi]
 
-        for start in range(0, total, batch_size):
-            end = min(start + batch_size, total)
-            batch_frames = frames[start:end]
-
-            batch_bgr = [vf.image for vf in batch_frames]
-            batch_rgb = [cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in batch_bgr]
-
-            results = model.predict(
-                source=batch_rgb,
-                verbose=False,
-                imgsz=imgsz,
-                conf=conf,
-                iou=iou,
-                device=device,
-                retina_masks=True,
+            output = overlay_detections_on_frame(
+                frame_bgr, result, class_names, alpha=alpha,
             )
 
-            for frame_bgr, result in zip(batch_bgr, results):
-                overlay = overlay_result_on_frame(
-                    frame_bgr=frame_bgr,
-                    result=result,
-                    class_names=class_names,
-                    alpha=alpha,
-                    lane_class_id=lane_class_id,
-                    enable_guided_trapezoid=enable_guided_trapezoid,
-                    min_trapezoid_score=min_trapezoid_score,
-                    smoother=smoother,
-                    frame_idx=global_frame_idx,
+            if chosen_quad is not None:
+                draw_chosen_lane(
+                    output, chosen_quad,
+                    best_frame_idx=chosen_best_frame,
+                    best_score=chosen_best_score,
                 )
-                writer.write(overlay)
-                global_frame_idx += 1
 
-            print(f"Processed frames {start}..{end - 1} / {total - 1}")
+            writer.write(output)
+
+            if (fi + 1) % 100 == 0 or fi == total - 1:
+                print(f"  rendered {fi + 1} / {total}")
     finally:
         writer.release()
 
     print(f"\nOverlay video saved to: {output_path}")
-    if smoother is not None:
-        print(f"Temporal tracking summary:\n{smoother.summary()}")
 
 
 # ---------------------------------------------------------------------------

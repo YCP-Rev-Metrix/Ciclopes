@@ -3,6 +3,8 @@ services:
     build: .
     image: ciclopes-api:latest
     container_name: ciclopes-api
+    env_file:
+      - .env
 
     # ── GPU access for RTX 5070 Ti (16GB) ────────────────────────────────────
     deploy:
