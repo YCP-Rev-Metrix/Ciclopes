@@ -88,7 +88,7 @@ def main():
     password = "string"
 
     # Input video to upload (place a small test file next to the repo root)
-    input_video = Path("test.mp4")
+    input_video = Path("shot1.mp4")
     output_video = Path("downloaded_test.mp4")
 
     # 1) Authorize
@@ -96,6 +96,8 @@ def main():
 
     # 2) Upload
     key = upload_video(token, input_video, folder="videos")
+
+    print(f"Uploaded video to {key}")
 
     # 3) Get presigned URL
     url = get_presigned_url(token, key, ttl_seconds=600)

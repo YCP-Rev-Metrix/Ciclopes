@@ -10,6 +10,16 @@ import numpy as np
 import torch
 
 from core.sam_3d_body import SAM3DBodyEstimator, load_sam_3d_body, load_sam_3d_body_hf
+from core.sam_3d_body.data.transforms import (
+    Compose,
+    GetBBoxCenterScale,
+    TopdownAffine,
+    VisionTransformWrapper,
+)
+from core.sam_3d_body.data.utils.prepare_batch import prepare_batch
+from core.sam_3d_body.utils import recursive_to
+from torchvision.transforms import ToTensor
+
 _body_models = _il.import_module("core.4DBody.models")
 JointObj = _body_models.JointObj
 Skeleton = _body_models.Skeleton
@@ -122,6 +132,87 @@ class Sam3DBodyInference:
             img=image_rgb,
             inference_type="body",
         )
+
+    # ── Batched inference ──────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def infer_batch(self, frames_rgb: list[np.ndarray], batch_size: int = 4) -> list[list[dict[str, Any]]]:
+        """
+        Run 3D body estimation on multiple frames in GPU batches.
+
+        Each frame is treated as containing 1 person (full-image bbox, no detector).
+        Frames are stacked along the batch dimension and forwarded through the
+        backbone + decoder in a single pass per chunk.
+
+        Args:
+            frames_rgb: list of (H, W, 3) uint8 RGB numpy arrays.
+            batch_size: number of frames per GPU forward pass.
+
+        Returns:
+            List (one per input frame) of result dicts.
+        """
+        if not frames_rgb:
+            return []
+
+        transform = self.estimator.transform
+        all_results: list[list[dict[str, Any]]] = []
+
+        for chunk_start in range(0, len(frames_rgb), batch_size):
+            chunk = frames_rgb[chunk_start : chunk_start + batch_size]
+            batches = []
+            frame_sizes = []
+
+            for frame in chunk:
+                h, w = frame.shape[:2]
+                frame_sizes.append((h, w))
+                bbox = np.array([0, 0, w, h]).reshape(1, 4)
+                single = prepare_batch(frame, transform, bbox)
+                batches.append(single)
+
+            # Stack along batch dimension:
+            # each single has img shape [1, 1, C, H_crop, W_crop]
+            # stacking → [N, 1, C, H_crop, W_crop]
+            stacked = {}
+            for key in ["img", "img_size", "ori_img_size", "bbox_center", "bbox_scale",
+                        "bbox", "affine_trans", "mask", "mask_score"]:
+                if key in batches[0]:
+                    stacked[key] = torch.cat([b[key] for b in batches], dim=0)
+            stacked["person_valid"] = torch.ones((len(chunk), 1))
+
+            # Camera intrinsics — use first frame's default (all same resolution in a video)
+            h0, w0 = frame_sizes[0]
+            focal = (h0**2 + w0**2) ** 0.5
+            n = len(chunk)
+            cam_int = torch.tensor([[focal, 0, w0 / 2.0],
+                                    [0, focal, h0 / 2.0],
+                                    [0, 0, 1]]).to(stacked["img"])
+            # Shape [N, 3, 3] — model adds person dim internally
+            stacked["cam_int"] = cam_int.unsqueeze(0).expand(n, -1, -1).contiguous()
+
+            # img_ori is only needed for "full" inference (hand re-crop), not "body"
+            stacked["img_ori"] = batches[0]["img_ori"]
+
+            stacked = recursive_to(stacked, "cuda")
+            self.model._initialize_batch(stacked)
+
+            pose_output = self.model.forward_step(stacked, decoder_type="body")
+
+            out = pose_output["mhr"]
+            out = recursive_to(out, "cpu")
+            out = recursive_to(out, "numpy")
+
+            for idx in range(len(chunk)):
+                all_results.append([{
+                    "bbox": stacked["bbox"][idx, 0].cpu().numpy(),
+                    "focal_length": out["focal_length"][idx],
+                    "pred_keypoints_3d": out["pred_keypoints_3d"][idx],
+                    "pred_keypoints_2d": out["pred_keypoints_2d"][idx],
+                    "pred_cam_t": out["pred_cam_t"][idx],
+                }])
+
+            torch.cuda.empty_cache()
+
+        return all_results
 
     # ── Convert raw output to our Skeleton model ─────────────────────────────
 

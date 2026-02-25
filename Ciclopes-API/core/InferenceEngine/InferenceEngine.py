@@ -82,10 +82,11 @@ class InferenceEngine:
         frames_rgb: list[np.ndarray],
         fps: float,
         start_frame: int,
+        batch_size: int = 32,
     ) -> dict[str, Any]:
         """
         Full lane-ball pipeline:
-          1) YOLO seg on all frames
+          1) YOLO seg on all frames (batched)
           2) first trapezoid homography search from start_frame
           3) ball contact-point projection to lane meters
           4) kinematics per quarter
@@ -106,14 +107,20 @@ class InferenceEngine:
             frames_rgb,
             float(fps),
             int(start_frame),
+            int(batch_size),
         )
 
     async def forward_sam3d_body(
         self,
         frames_rgb: list[np.ndarray],
+        batch_size: int = 4,
     ) -> list[list[dict[str, Any]]]:
         """
-        Run SAM 3D Body skeleton estimation on every frame.
+        Run SAM 3D Body skeleton estimation on every frame using batched GPU inference.
+
+        Args:
+            frames_rgb: list of (H, W, 3) uint8 RGB numpy arrays.
+            batch_size: frames per GPU forward pass (set via SAM3D_BODY_BATCH_SIZE).
 
         Returns:
             List (one entry per frame) of lists (one entry per detected person)
@@ -127,17 +134,21 @@ class InferenceEngine:
             self._executor,
             self._run_sam3d_body_sync,
             frames_rgb,
+            batch_size,
         )
 
     def _run_sam3d_body_sync(
-        self, frames_rgb: list[np.ndarray]
+        self, frames_rgb: list[np.ndarray], batch_size: int = 4
     ) -> list[list[dict[str, Any]]]:
-        all_frames: list[list[dict[str, Any]]] = []
+        t0 = time.perf_counter()
 
-        for idx, frame in enumerate(frames_rgb):
-            skeletons = self.sam3d_body.frame_to_skeletons(frame)
+        batch_results = self.sam3d_body.infer_batch(frames_rgb, batch_size=batch_size)
+
+        all_frames: list[list[dict[str, Any]]] = []
+        for frame_persons in batch_results:
             frame_joints: list[dict[str, Any]] = []
-            for skeleton in skeletons:
+            for person in frame_persons:
+                skeleton = Sam3DBodyInference.extract_skeleton(person)
                 for joint in skeleton.joints:
                     frame_joints.append(
                         {
@@ -148,10 +159,12 @@ class InferenceEngine:
                         }
                     )
             all_frames.append(frame_joints)
-            if (idx + 1) % 50 == 0:
-                logger.info("SAM3D Body: processed %d / %d frames", idx + 1, len(frames_rgb))
 
-        logger.info("SAM3D Body: finished all %d frames", len(frames_rgb))
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        logger.info(
+            "SAM3D Body: %d frames, batch_size=%d, %.1f ms total",
+            len(frames_rgb), batch_size, elapsed_ms,
+        )
         return all_frames
 
     # ── Internal: YOLO seg on the first frame only ────────────────────────────
@@ -164,15 +177,27 @@ class InferenceEngine:
         return LaneBallInference.extract_masks(raw_results)
 
     def _run_lane_ball_pipeline_sync(
-        self, frames_rgb: list[np.ndarray], fps: float, start_frame: int
+        self, frames_rgb: list[np.ndarray], fps: float, start_frame: int,
+        batch_size: int = 32,
     ) -> dict[str, Any]:
         inference_t0 = time.perf_counter()
-        raw_results = self.lane_ball.infer_batch(frames_rgb)
+        # Chunk frames to respect batch_size and avoid VRAM spikes
+        raw_results = []
+        for i in range(0, len(frames_rgb), batch_size):
+            chunk = frames_rgb[i : i + batch_size]
+            raw_results.extend(self.lane_ball.infer_batch(chunk))
         inference_ms = (time.perf_counter() - inference_t0) * 1000.0
 
         segmentations_by_frame = {
             idx: extract_frame_segmentation(res) for idx, res in enumerate(raw_results)
         }
+
+        total_ball_masks = sum(len(s.ball_masks) for s in segmentations_by_frame.values())
+        total_lane_masks = sum(len(s.lane_masks) for s in segmentations_by_frame.values())
+        logger.info(
+            "Segmentation extraction: %d frames, %d total ball masks, %d total lane masks",
+            len(segmentations_by_frame), total_ball_masks, total_lane_masks,
+        )
 
         post_t0 = time.perf_counter()
         try:

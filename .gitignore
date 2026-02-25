@@ -34,3 +34,4 @@ OPTIMIZATION_SUMMARY.md
 *.mp4
 /pipeline_v2/.claude
 *.avi
+Ciclopes-API/.env

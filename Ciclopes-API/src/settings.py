@@ -13,6 +13,8 @@ class AppSettings:
     verify_api: bool = True
     verify_presigned: bool = True
     presign_ttl_seconds: int = 3600
+    lane_ball_batch_size: int = 32
+    sam3d_body_batch_size: int = 4
 
 
 def _parse_bool(raw: str | None, *, default: bool) -> bool:
@@ -60,6 +62,18 @@ def load_app_settings() -> AppSettings:
     except ValueError:
         ttl = 3600
 
+    lb_bs_raw = _env("LANE_BALL_BATCH_SIZE", default="32")
+    try:
+        lb_bs = max(int(lb_bs_raw), 1)
+    except ValueError:
+        lb_bs = 32
+
+    sam3d_bs_raw = _env("SAM3D_BODY_BATCH_SIZE", default="4")
+    try:
+        sam3d_bs = max(int(sam3d_bs_raw), 1)
+    except ValueError:
+        sam3d_bs = 4
+
     return AppSettings(
         api_base=_env("API_BASE", "api_base", default="https://api.revmetrix.io"),
         username=_env("API_USERNAME", "USERNAME", "username"),
@@ -69,4 +83,6 @@ def load_app_settings() -> AppSettings:
             _env("VERIFY_PRESIGNED", "verify_presigned", default="true"), default=True
         ),
         presign_ttl_seconds=max(ttl, 1),
+        lane_ball_batch_size=lb_bs,
+        sam3d_body_batch_size=sam3d_bs,
     )

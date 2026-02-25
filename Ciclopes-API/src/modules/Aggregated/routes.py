@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Request
 from src.modules.Aggregated.models import AggRunInput, AggRunOutput, BallPoint, KinematicsRow, SkeletonPoint
 
 logger = logging.getLogger("ciclopes.aggregated_routes")
-HARDCODED_START_FRAME = 120
+HARDCODED_START_FRAME = 10
 
 router = APIRouter(
     prefix="/agg",
@@ -78,8 +78,12 @@ async def run_aggregate_pipeline(request: Request, payload: AggRunInput):
         frames_rgb=rgb_frames,
         fps=fps,
         start_frame=HARDCODED_START_FRAME,
+        batch_size=settings.lane_ball_batch_size,
     )
-    sam3d_coro = engine.forward_sam3d_body(frames_rgb=rgb_frames)
+    sam3d_coro = engine.forward_sam3d_body(
+        frames_rgb=rgb_frames,
+        batch_size=settings.sam3d_body_batch_size,
+    )
 
     try:
         lane_ball_output, sam3d_output = await asyncio.gather(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
@@ -9,6 +10,7 @@ import numpy as np
 from core.LaneBalls.Preprocessing import FrameSegmentation
 from core.LaneBalls.models import BallPos, BallPosList
 
+logger = logging.getLogger("ciclopes.lane_ball_postprocessing")
 
 LANE_LENGTH_M = 18.288
 LANE_WIDTH_M = 1.0541
@@ -745,6 +747,12 @@ def run_lane_ball_postprocessing(
             f"from start_frame={start_frame}"
         )
 
+    logger.info(
+        "Active lane: best_frame=%d best_score=%.3f ball_votes=%d seen=%d",
+        active_lane.best_frame_idx, active_lane.best_score,
+        active_lane.ball_votes, active_lane.seen_count,
+    )
+
     src_corners = active_lane.best_quad.astype(np.float32)
     dst = _lane_dst_corners_m()
     homography = cv2.getPerspectiveTransform(src_corners, dst)
@@ -760,12 +768,16 @@ def run_lane_ball_postprocessing(
 
     positions: List[BallPos] = []
     frames_with_ball = 0
+    frames_with_ball_masks = 0
 
     for frame_index in sorted(segmentations_by_frame.keys()):
-        if frame_index < selection.frame_index:
+        if frame_index < start_frame:
             continue
 
         frame_seg = segmentations_by_frame[frame_index]
+        if frame_seg.ball_masks:
+            frames_with_ball_masks += 1
+
         contact = _choose_ball_contact_for_lane(
             frame_seg.ball_masks,
             selection.src_corners,
@@ -786,6 +798,11 @@ def run_lane_ball_postprocessing(
                 y_m=y_m,
             )
         )
+
+    logger.info(
+        "Ball projection: %d frames with ball masks, %d with valid contact, %d positions emitted",
+        frames_with_ball_masks, frames_with_ball, len(positions),
+    )
 
     det = float(np.linalg.det(selection.homography))
     cond = float(np.linalg.cond(selection.homography))
