@@ -15,4 +15,5 @@ class SkeletonPoint(BaseModel):
 
 
 class Sam3DBodyRunOutput(BaseModel):
+    fps: float = Field(..., description="Source video frame rate — use for playback speed on the frontend")
     skeleton_points: list[list[SkeletonPoint]]

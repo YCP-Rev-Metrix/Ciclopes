@@ -132,6 +132,7 @@ async def run_lane_ball_pipeline(request: Request, payload: LaneBallRunInput):
     )
 
     return LaneBallRunOutput(
+        fps=fps,
         ball_points=ball_points,
         kinematics_table=kinematics_table,
         is_trapezoid=lane_ball_output.get("is_trapezoid", False),

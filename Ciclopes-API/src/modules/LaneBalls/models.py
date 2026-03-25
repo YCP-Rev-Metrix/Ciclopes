@@ -35,6 +35,7 @@ class LaneBallHealthInfo(BaseModel):
 
 
 class LaneBallRunOutput(BaseModel):
+    fps: float = Field(..., description="Source video frame rate — use for playback speed on the frontend")
     ball_points: list[BallPoint]
     kinematics_table: list[KinematicsRow]
     is_trapezoid: bool = False

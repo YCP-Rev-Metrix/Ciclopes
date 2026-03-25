@@ -5,8 +5,13 @@ import logging
 import cv2
 from fastapi import APIRouter, HTTPException, Request
 
+import importlib as _il
+
 from src.modules.fourDbody.models import Sam3DBodyRunInput, Sam3DBodyRunOutput, SkeletonPoint
 from core.VideoUtil.FrameSplit import split_video_into_frames
+
+_ema_mod = _il.import_module("core.4DBody.emaSmoothing")
+ema_smooth_skeleton_frames = _ema_mod.ema_smooth_skeleton_frames
 from core.VideoUtil.SpacesApiClient import query_video_via_api_to_temp_file
 
 logger = logging.getLogger("ciclopes.fourdbody_routes")
@@ -66,8 +71,10 @@ async def run_sam3d_body_pipeline(request: Request, payload: Sam3DBodyRunInput):
     with temp_ctx as temp_path:
         split_video = split_video_into_frames(str(temp_path))
 
+    fps = float(split_video.fps) if split_video.fps > 0 else 30.0
+
     if not split_video.frames:
-        return Sam3DBodyRunOutput(skeleton_points=[])
+        return Sam3DBodyRunOutput(fps=fps, skeleton_points=[])
 
     rgb_frames = [cv2.cvtColor(vf.image, cv2.COLOR_BGR2RGB) for vf in split_video.frames]
 
@@ -80,6 +87,9 @@ async def run_sam3d_body_pipeline(request: Request, payload: Sam3DBodyRunInput):
         logger.exception("/fourdbody/run pipeline failed")
         raise HTTPException(status_code=500, detail=f"Pipeline error: {exc}")
 
+    # ── EMA smoothing to reduce jitter ────────────────────────────────────
+    smoothed_output = ema_smooth_skeleton_frames(sam3d_output)
+
     # ── Parse results ─────────────────────────────────────────────────────
     skeleton_points = [
         [
@@ -91,7 +101,7 @@ async def run_sam3d_body_pipeline(request: Request, payload: Sam3DBodyRunInput):
             )
             for j in frame_joints
         ]
-        for frame_joints in sam3d_output
+        for frame_joints in smoothed_output
     ]
 
-    return Sam3DBodyRunOutput(skeleton_points=skeleton_points)
+    return Sam3DBodyRunOutput(fps=fps, skeleton_points=skeleton_points)
