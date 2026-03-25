@@ -8,6 +8,7 @@ requests
 
 # ── Scientific / vision ───────────────────────────────────────────────────────
 numpy
+scipy
 opencv-python
 
 # ── PyTorch (nightly cu124 installed via Dockerfile for Blackwell GPU) ────────

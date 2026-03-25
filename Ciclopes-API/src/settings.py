@@ -15,6 +15,7 @@ class AppSettings:
     presign_ttl_seconds: int = 3600
     lane_ball_batch_size: int = 32
     sam3d_body_batch_size: int = 4
+    lane_ball_start_frame: int = 10  # demo default — skip first N frames
 
 
 def _parse_bool(raw: str | None, *, default: bool) -> bool:

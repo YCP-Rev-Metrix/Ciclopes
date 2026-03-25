@@ -12,6 +12,8 @@ import torch
 
 from core.InferenceEngine.LaneBallInference import LaneBallInference
 from core.InferenceEngine.Sam3DBodyInference import Sam3DBodyInference
+from core.LaneBalls.Extrapolation import append_departure_point, trim_raw_detections
+from core.LaneBalls.Interprolation import interpolate_ball_positions
 from core.LaneBalls.Kinematics import compute_kinematics_per_quarter
 from core.LaneBalls.Postprocessing import run_lane_ball_postprocessing
 from core.LaneBalls.Preprocessing import extract_frame_segmentation
@@ -234,7 +236,12 @@ class InferenceEngine:
             }
         post_ms = (time.perf_counter() - post_t0) * 1000.0
 
-        kin = compute_kinematics_per_quarter(post.ball_positions.ball_positions)
+        # ── Trim → Interpolate → Departure → Kinematics ─────────────────
+        raw_positions = post.ball_positions.ball_positions
+        clean_positions = trim_raw_detections(raw_positions)
+        smooth_positions = interpolate_ball_positions(clean_positions, fps)
+        final_positions = append_departure_point(smooth_positions, fps)
+        kin = compute_kinematics_per_quarter(final_positions)
 
         return {
             "positions": [
@@ -244,7 +251,7 @@ class InferenceEngine:
                     "x_m": p.x_m,
                     "y_m": p.y_m,
                 }
-                for p in post.ball_positions.ball_positions
+                for p in final_positions
             ],
             "kinematics": {
                 "quarters": [
