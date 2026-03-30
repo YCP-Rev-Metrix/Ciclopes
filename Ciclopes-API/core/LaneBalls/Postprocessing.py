@@ -675,6 +675,88 @@ def _project_point_homography(pt_xy: tuple[float, float], H: np.ndarray) -> tupl
     return x, y
 
 
+def _correct_trapezoid_top_corners(
+    quad: np.ndarray,
+) -> np.ndarray:
+    """
+    Snap each far-end (top) corner onto its vanishing ray to correct
+    lateral drift without changing its depth along the ray.
+
+    The bottom corners (close to camera) are trusted.  The top corners
+    (far from camera, near the pins) can drift laterally off the true
+    leg line.  This projects each top corner onto the line from its
+    corresponding bottom corner through the vanishing point.
+
+    Each corner keeps its own depth (λ) — we do NOT average them.
+    Averaging would break a corner that was already correct by pulling
+    it toward one that was wrong.
+
+    Corner order: [tl, tr, br, bl]  (same as order_quad_points output).
+    """
+    quad_f = quad.astype(np.float64)
+    tl, tr, br, bl = quad_f[0], quad_f[1], quad_f[2], quad_f[3]
+
+    # ── Step 1: vanishing point from leg lines ───────────────────────────
+    def _homogeneous(p: np.ndarray) -> np.ndarray:
+        return np.array([p[0], p[1], 1.0])
+
+    L_left = np.cross(_homogeneous(bl), _homogeneous(tl))
+    L_right = np.cross(_homogeneous(br), _homogeneous(tr))
+    V_h = np.cross(L_left, L_right)
+
+    if abs(V_h[2]) < 1e-10:
+        logger.info("Trapezoid correction: legs parallel, skipping")
+        return quad
+
+    V = V_h[:2] / V_h[2]
+
+    # Sanity: vanishing point should be above the top corners
+    if V[1] > min(tl[1], tr[1]):
+        logger.warning(
+            "Trapezoid correction: vanishing point below top corners "
+            "(V_y=%.1f, tl_y=%.1f), skipping", V[1], tl[1],
+        )
+        return quad
+
+    # ── Step 2: project each top corner onto its own vanishing ray ───────
+    ray_left = V - bl
+    ray_right = V - br
+
+    ray_left_sq = float(np.dot(ray_left, ray_left))
+    ray_right_sq = float(np.dot(ray_right, ray_right))
+
+    if ray_left_sq < 1.0 or ray_right_sq < 1.0:
+        return quad
+
+    # Each corner gets its own λ — the closest point on its ray
+    lam_left = float(np.dot(tl - bl, ray_left) / ray_left_sq)
+    lam_right = float(np.dot(tr - br, ray_right) / ray_right_sq)
+
+    if lam_left <= 0.0 or lam_left >= 1.0 or lam_right <= 0.0 or lam_right >= 1.0:
+        logger.warning(
+            "Trapezoid correction: λ out of range (L=%.4f R=%.4f), skipping",
+            lam_left, lam_right,
+        )
+        return quad
+
+    tl_new = bl + lam_left * ray_left
+    tr_new = br + lam_right * ray_right
+
+    correction_tl = float(np.linalg.norm(tl_new - tl))
+    correction_tr = float(np.linalg.norm(tr_new - tr))
+
+    logger.info(
+        "Trapezoid correction: λ_L=%.4f λ_R=%.4f, "
+        "tl shifted %.1fpx, tr shifted %.1fpx",
+        lam_left, lam_right, correction_tl, correction_tr,
+    )
+
+    result = quad.copy().astype(np.float32)
+    result[0] = tl_new.astype(np.float32)
+    result[1] = tr_new.astype(np.float32)
+    return result
+
+
 def run_lane_ball_postprocessing(
     segmentations_by_frame: Dict[int, FrameSegmentation],
     fps: float,
@@ -754,6 +836,7 @@ def run_lane_ball_postprocessing(
     )
 
     src_corners = active_lane.best_quad.astype(np.float32)
+    src_corners = _correct_trapezoid_top_corners(src_corners)
     dst = _lane_dst_corners_m()
     homography = cv2.getPerspectiveTransform(src_corners, dst)
 

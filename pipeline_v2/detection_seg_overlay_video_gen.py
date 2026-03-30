@@ -12,6 +12,18 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+# Lane physical dimensions (regulation bowling lane).
+LANE_LENGTH_M = 18.288
+LANE_WIDTH_M = 1.0541
+
+
+@dataclass
+class BallPos:
+    frame_index: int
+    timestamp_s: float
+    x_m: float
+    y_m: float
+
 
 @dataclass
 class VideoFrame:
@@ -826,6 +838,180 @@ def find_nearest_pins_box(
 
 
 # ---------------------------------------------------------------------------
+# Lane homography helpers
+# ---------------------------------------------------------------------------
+
+def _lane_dst_corners_m() -> np.ndarray:
+    """Destination rectangle in metres: TL, TR, BR, BL."""
+    return np.array(
+        [
+            [0.0, LANE_LENGTH_M],
+            [LANE_WIDTH_M, LANE_LENGTH_M],
+            [LANE_WIDTH_M, 0.0],
+            [0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _masks_to_boxes(masks: List[np.ndarray]) -> List[np.ndarray]:
+    """Convert binary masks to [x1, y1, x2, y2] bounding boxes."""
+    boxes: List[np.ndarray] = []
+    for mask in masks:
+        ys, xs = np.where(mask > 0)
+        if xs.size == 0 or ys.size == 0:
+            continue
+        x1, x2 = int(xs.min()), int(xs.max())
+        y1, y2 = int(ys.min()), int(ys.max())
+        boxes.append(np.array([x1, y1, x2, y2], dtype=np.int32))
+    return boxes
+
+
+def _ball_contact_point_from_mask(ball_mask: np.ndarray) -> tuple[float, float] | None:
+    """
+    Find the bottom contact point of a ball mask — the point where the ball
+    touches the lane surface. Uses the bottom-most row of the mask and the
+    mean x at that row.
+    """
+    ys, xs = np.where(ball_mask > 0)
+    if xs.size == 0:
+        return None
+
+    y_contact = int(np.max(ys))
+    xs_at_contact = xs[ys == y_contact]
+    if xs_at_contact.size == 0:
+        return None
+    x_contact = float(np.mean(xs_at_contact))
+    return x_contact, float(y_contact)
+
+
+def _choose_ball_contact_for_lane(
+    ball_masks: List[np.ndarray],
+    lane_polygon: np.ndarray,
+) -> tuple[float, float] | None:
+    """
+    Pick the best ball contact point for a given lane polygon.
+
+    Priority (lower tuple key is better):
+      1. Ball inside the lane polygon over outside.
+      2. Higher y (closer to camera / further down the lane).
+      3. Closer to the lane centre-x.
+      4. Larger mask area.
+    """
+    if not ball_masks:
+        return None
+
+    lane_poly = lane_polygon.reshape((-1, 1, 2)).astype(np.float32)
+    lane_center_x = float(np.mean(lane_polygon[:, 0]))
+
+    best_point: tuple[float, float] | None = None
+    best_key: tuple[float, float, float, float] | None = None
+
+    for mask in ball_masks:
+        contact = _ball_contact_point_from_mask(mask)
+        if contact is None:
+            continue
+
+        x_contact, y_contact = contact
+        inside = cv2.pointPolygonTest(
+            lane_poly,
+            (float(x_contact), float(y_contact)),
+            measureDist=False,
+        ) >= 0
+
+        area = float(np.count_nonzero(mask))
+        key = (
+            0.0 if inside else 1.0,
+            -float(y_contact),
+            abs(float(x_contact) - lane_center_x),
+            -area,
+        )
+
+        if best_key is None or key < best_key:
+            best_key = key
+            best_point = (float(x_contact), float(y_contact))
+
+    return best_point
+
+
+def _project_point_homography(
+    pt_xy: tuple[float, float], H: np.ndarray,
+) -> tuple[float, float]:
+    """Project a pixel-space point through a 3×3 homography to lane metres."""
+    vec = np.array([pt_xy[0], pt_xy[1], 1.0], dtype=np.float64)
+    dst = H @ vec
+    if abs(float(dst[2])) < 1e-9:
+        raise RuntimeError("Invalid homography projection: denominator ~0")
+    x = float(dst[0] / dst[2])
+    y = float(dst[1] / dst[2])
+    return x, y
+
+
+def _correct_trapezoid_top_corners(
+    quad: np.ndarray,
+) -> np.ndarray:
+    """
+    Snap each far-end (top) corner onto its vanishing ray to correct
+    lateral drift without changing its depth along the ray.
+
+    The bottom corners (close to camera) are trusted.  The top corners
+    (far from camera, near the pins) can drift laterally off the true
+    leg line.  This projects each top corner onto the line from its
+    corresponding bottom corner through the vanishing point.
+
+    Each corner keeps its own depth (λ) — we do NOT average them.
+    Averaging would break a corner that was already correct by pulling
+    it toward one that was wrong.
+
+    Corner order: [tl, tr, br, bl]  (same as order_quad_points output).
+    """
+    quad_f = quad.astype(np.float64)
+    tl, tr, br, bl = quad_f[0], quad_f[1], quad_f[2], quad_f[3]
+
+    # Vanishing point from leg lines.
+    def _homogeneous(p: np.ndarray) -> np.ndarray:
+        return np.array([p[0], p[1], 1.0])
+
+    L_left = np.cross(_homogeneous(bl), _homogeneous(tl))
+    L_right = np.cross(_homogeneous(br), _homogeneous(tr))
+    V_h = np.cross(L_left, L_right)
+
+    if abs(V_h[2]) < 1e-10:
+        return quad
+
+    V = V_h[:2] / V_h[2]
+
+    # Sanity: vanishing point should be above the top corners.
+    if V[1] > min(tl[1], tr[1]):
+        return quad
+
+    # Project each top corner onto its own vanishing ray.
+    ray_left = V - bl
+    ray_right = V - br
+
+    ray_left_sq = float(np.dot(ray_left, ray_left))
+    ray_right_sq = float(np.dot(ray_right, ray_right))
+
+    if ray_left_sq < 1.0 or ray_right_sq < 1.0:
+        return quad
+
+    # Each corner gets its own λ — the closest point on its ray.
+    lam_left = float(np.dot(tl - bl, ray_left) / ray_left_sq)
+    lam_right = float(np.dot(tr - br, ray_right) / ray_right_sq)
+
+    if lam_left <= 0.0 or lam_left >= 1.0 or lam_right <= 0.0 or lam_right >= 1.0:
+        return quad
+
+    tl_new = bl + lam_left * ray_left
+    tr_new = br + lam_right * ray_right
+
+    result = quad.copy().astype(np.float32)
+    result[0] = tl_new.astype(np.float32)
+    result[1] = tr_new.astype(np.float32)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Core: build lane trapezoid
 # ---------------------------------------------------------------------------
 
@@ -932,16 +1118,16 @@ def extract_detections(
     pins_class_id: int,
     ball_class_id: int,
     frame_shape_hw: tuple[int, int],
-) -> tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+) -> tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
     """
-    Extract all lane instance masks, pins bounding boxes, and ball bounding
-    boxes from a result.
-    Returns (lane_masks, pins_boxes_xyxy, ball_boxes_xyxy).
+    Extract all lane instance masks, pins bounding boxes, ball bounding
+    boxes, and ball masks from a result.
+    Returns (lane_masks, pins_boxes_xyxy, ball_boxes_xyxy, ball_masks).
     """
     boxes = getattr(result, "boxes", None)
     masks = getattr(result, "masks", None)
     if boxes is None or masks is None or getattr(masks, "data", None) is None:
-        return [], [], []
+        return [], [], [], []
 
     cls_ids = boxes.cls.detach().cpu().numpy().astype(int)
     mask_arr = masks.data.detach().cpu().numpy()
@@ -951,6 +1137,7 @@ def extract_detections(
     lane_masks: List[np.ndarray] = []
     pins_boxes: List[np.ndarray] = []
     ball_boxes: List[np.ndarray] = []
+    ball_masks: List[np.ndarray] = []
 
     for i, cls_id in enumerate(cls_ids):
         cid = int(cls_id)
@@ -964,8 +1151,13 @@ def extract_detections(
             pins_boxes.append(xyxy[i])
         elif cid == ball_class_id:
             ball_boxes.append(xyxy[i])
+            if i < mask_arr.shape[0]:
+                bmask = (mask_arr[i] > 0.5).astype(np.uint8)
+                if bmask.shape != (h, w):
+                    bmask = cv2.resize(bmask, (w, h), interpolation=cv2.INTER_NEAREST)
+                ball_masks.append(bmask)
 
-    return lane_masks, pins_boxes, ball_boxes
+    return lane_masks, pins_boxes, ball_boxes, ball_masks
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1199,26 @@ def draw_chosen_lane(
         image, text,
         (int(tl[0]), max(20, int(tl[1]) - 16)),
         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA,
+    )
+
+
+def draw_ball_contact(
+    image: np.ndarray,
+    contact_px: tuple[float, float],
+    ball_pos: BallPos,
+) -> None:
+    """Draw the ball contact point and its metre-space coordinates."""
+    cx, cy = int(contact_px[0]), int(contact_px[1])
+    color = (0, 200, 255)  # orange-yellow
+
+    cv2.circle(image, (cx, cy), 8, color, -1, cv2.LINE_AA)
+    cv2.circle(image, (cx, cy), 8, (0, 0, 0), 2, cv2.LINE_AA)
+
+    label = f"({ball_pos.x_m:.2f}m, {ball_pos.y_m:.2f}m)"
+    cv2.putText(
+        image, label,
+        (cx + 12, cy - 8),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA,
     )
 
 
@@ -1099,13 +1311,16 @@ def run_overlay_generation(
 
     # ---------------------------------------------------------------
     # Pass 1: inference + trapezoid tracking + ball-lane association.
-    # Store results so we don't re-run inference in pass 2.
+    # Store results and per-frame ball masks for pass 2.
     # ---------------------------------------------------------------
     print("Pass 1: running inference and tracking lanes...")
     smoother = TemporalSmoother() if enable_guided_trapezoid else None
     ball_class_id = 0
     pins_class_id = 2
     all_results: List[Any] = []
+    all_ball_masks: Dict[int, List[np.ndarray]] = {}
+
+    h, w = split_video.height, split_video.width
 
     for start in range(0, total, batch_size):
         end = min(start + batch_size, total)
@@ -1124,19 +1339,22 @@ def run_overlay_generation(
             retina_masks=True,
         )
 
-        h, w = split_video.height, split_video.width
         for fi, (frame_bgr, result) in enumerate(zip(batch_bgr, results)):
             frame_idx = start + fi
             all_results.append(result)
 
             if smoother is not None and enable_guided_trapezoid:
-                lane_masks, pins_boxes, ball_boxes = extract_detections(
+                lane_masks, pins_boxes, ball_boxes, ball_masks = extract_detections(
                     result,
                     lane_class_id=lane_class_id,
                     pins_class_id=pins_class_id,
                     ball_class_id=ball_class_id,
                     frame_shape_hw=(h, w),
                 )
+
+                # Store ball masks for pass 2 ball-position projection.
+                if ball_masks:
+                    all_ball_masks[frame_idx] = ball_masks
 
                 candidates: List[TrapezoidCandidate] = []
                 mask_areas: List[float] = []
@@ -1157,26 +1375,76 @@ def run_overlay_generation(
 
         print(f"  inference {start}..{end - 1} / {total - 1}")
 
-    # Select active lane and its best trapezoid.
+    # ---------------------------------------------------------------
+    # Select active lane, compute homography, project ball positions.
+    # ---------------------------------------------------------------
     chosen_quad: np.ndarray | None = None
     chosen_best_frame = 0
     chosen_best_score = 0.0
+    homography: np.ndarray | None = None
+    ball_positions: List[BallPos] = []
+    # Map frame_index → (contact_px, BallPos) for overlay drawing.
+    frame_ball_data: Dict[int, tuple[tuple[float, float], BallPos]] = {}
 
     if smoother is not None:
         active = smoother.select_active_lane()
         if active is not None:
-            chosen_quad = active.best_quad.copy()
             chosen_best_frame = active.best_frame_idx
             chosen_best_score = active.best_score
+
+            # Correct far-end top corners using vanishing-point geometry.
+            src_corners = _correct_trapezoid_top_corners(active.best_quad.astype(np.float32))
+            chosen_quad = src_corners.astype(np.int32)
+
+            # Compute homography: pixel quad → real-world lane metres.
+            dst_corners = _lane_dst_corners_m()
+            homography = cv2.getPerspectiveTransform(
+                src_corners.astype(np.float32), dst_corners,
+            )
+
+            det = float(np.linalg.det(homography))
+            cond = float(np.linalg.cond(homography))
+
             print(f"\nActive lane selected:")
             print(f"  ball_votes={active.ball_votes}  "
                   f"avg_area={active.total_mask_area / max(active.seen_count, 1):.0f}  "
                   f"best_score={active.best_score:.3f}  "
                   f"best_frame={active.best_frame_idx}")
+            print(f"  homography det={det:.6f}  cond={cond:.1f}")
+
+            # Project ball contact points through homography.
+            for frame_idx in sorted(all_ball_masks.keys()):
+                contact = _choose_ball_contact_for_lane(
+                    all_ball_masks[frame_idx],
+                    src_corners,
+                )
+                if contact is None:
+                    continue
+
+                try:
+                    x_m, y_m = _project_point_homography(contact, homography)
+                except RuntimeError:
+                    continue
+
+                x_m = float(np.clip(x_m, -0.5, LANE_WIDTH_M + 0.5))
+                y_m = float(np.clip(y_m, -1.0, LANE_LENGTH_M + 1.0))
+
+                bp = BallPos(
+                    frame_index=frame_idx,
+                    timestamp_s=float(frame_idx / max(fps, 1e-6)),
+                    x_m=x_m,
+                    y_m=y_m,
+                )
+                ball_positions.append(bp)
+                frame_ball_data[frame_idx] = (contact, bp)
+
+            print(f"  ball positions projected: {len(ball_positions)} / "
+                  f"{len(all_ball_masks)} frames with ball masks")
+
         print(f"\nAll lane tracks:\n{smoother.summary()}")
 
     # ---------------------------------------------------------------
-    # Pass 2: render overlay video with chosen lane on every frame.
+    # Pass 2: render overlay video with chosen lane + ball positions.
     # ---------------------------------------------------------------
     print(f"\nPass 2: rendering output video...")
     writer = cv2.VideoWriter(
@@ -1204,6 +1472,10 @@ def run_overlay_generation(
                     best_score=chosen_best_score,
                 )
 
+            if fi in frame_ball_data:
+                contact_px, bp = frame_ball_data[fi]
+                draw_ball_contact(output, contact_px, bp)
+
             writer.write(output)
 
             if (fi + 1) % 100 == 0 or fi == total - 1:
@@ -1212,6 +1484,13 @@ def run_overlay_generation(
         writer.release()
 
     print(f"\nOverlay video saved to: {output_path}")
+
+    # Print ball position summary.
+    if ball_positions:
+        print(f"\n--- Ball Positions ({len(ball_positions)} points) ---")
+        print(f"{'frame':>6} {'time_s':>8} {'x_m':>8} {'y_m':>8}")
+        for bp in ball_positions:
+            print(f"{bp.frame_index:6d} {bp.timestamp_s:8.3f} {bp.x_m:8.3f} {bp.y_m:8.3f}")
 
 
 # ---------------------------------------------------------------------------
