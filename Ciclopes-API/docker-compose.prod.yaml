@@ -1,0 +1,42 @@
+services:
+  ciclopes-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    image: ciclopes-api:prod
+    container_name: ciclopes-api
+    env_file:
+      - .env
+
+    # ── GPU access for 2x RTX 2080 (8GB each) ──────────────────────────────
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # ── Shared memory for PyTorch (dataloader multiprocessing) ───────────────
+    shm_size: '8gb'
+
+    # ── Volumes ──────────────────────────────────────────────────────────────
+    volumes:
+      - .:/app                                               # Live code reload
+      - ./cache:/app/cache                                   # Model download cache
+      - ~/.cache/huggingface:/root/.cache/huggingface        # Share HF cache with host
+
+    # ── Environment ──────────────────────────────────────────────────────────
+    environment:
+      - CUDA_VISIBLE_DEVICES=0,1
+      - PYTHONPATH=/app:/app/core
+      - HF_HOME=/root/.cache/huggingface
+      - HF_TOKEN=${HF_TOKEN:-}
+      - SAM3D_BODY_HF_REPO_ID=${SAM3D_BODY_HF_REPO_ID:-facebook/sam-3d-body-dinov3}
+
+    # ── Ports ────────────────────────────────────────────────────────────────
+    ports:
+      - "8000:8000"
+
+    stdin_open: true
+    tty: true

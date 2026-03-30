@@ -20,7 +20,7 @@ async def lifespan(app: FastAPI):
     """
     logger.info("Loading inference models — this may take a moment on first run...")
     app.state.settings = load_app_settings()
-    app.state.inference_engine = InferenceEngine()
+    app.state.inference_engine = InferenceEngine(multi_gpu=app.state.settings.multi_gpu)
     logger.info("InferenceEngine ready: %s", app.state.inference_engine.status())
     yield
     logger.info("Shutting down InferenceEngine.")

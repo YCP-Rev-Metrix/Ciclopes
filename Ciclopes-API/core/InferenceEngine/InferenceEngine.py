@@ -26,29 +26,48 @@ class InferenceEngine:
     Inference orchestrator.
 
     Manages the YOLO segmentation model (ball / lane / pins) and
-    SAM 3D Body (skeleton estimation) on a single GPU.
+    SAM 3D Body (skeleton estimation). Supports single-GPU (default) or
+    multi-GPU mode where each model gets its own device.
 
     Call `forward()` to run YOLO segmentation on the first RGB frame.
     Call `forward_sam3d_body()` to run 3D skeleton estimation on a list of frames.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, multi_gpu: bool = False) -> None:
         self.initialized_at = datetime.now(timezone.utc)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.multi_gpu = multi_gpu
 
-        logger.info("Initializing InferenceEngine on device=%s", self.device)
+        if multi_gpu and torch.cuda.is_available() and torch.cuda.device_count() >= 2:
+            self.device_lane_ball = torch.device("cuda:0")
+            self.device_sam3d = torch.device("cuda:1")
+            logger.info(
+                "Multi-GPU mode: LaneBall → %s, SAM3D Body → %s",
+                self.device_lane_ball, self.device_sam3d,
+            )
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.device_lane_ball = device
+            self.device_sam3d = device
+            if multi_gpu:
+                logger.warning(
+                    "MULTI_GPU=true but only %d GPU(s) detected — falling back to single device %s",
+                    torch.cuda.device_count(), device,
+                )
+            else:
+                logger.info("Single-GPU mode: both models on %s", device)
+
+        # For backwards compat (status endpoint, etc.)
+        self.device = self.device_lane_ball
 
         # ── Load active models ────────────────────────────────────────────────
-        self.lane_ball = LaneBallInference(device=str(self.device))
-        self.sam3d_body = Sam3DBodyInference(device=str(self.device))
+        self.lane_ball = LaneBallInference(device=str(self.device_lane_ball))
+        self.sam3d_body = Sam3DBodyInference(device=str(self.device_sam3d))
 
         # Thread pool for running sync model inference in async context.
         # Keep 2 workers so both models can run concurrently.
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="inference")
 
-        logger.info(
-            "InferenceEngine ready — LaneBall + SAM3D Body loaded on %s", self.device
-        )
+        logger.info("InferenceEngine ready")
 
     # ── Async forward pass ────────────────────────────────────────────────────
 
@@ -289,18 +308,27 @@ class InferenceEngine:
     def status(self) -> dict[str, Any]:
         """Return engine health info including device and VRAM usage."""
         info: dict[str, Any] = {
-            "device": str(self.device),
+            "multi_gpu": self.multi_gpu,
+            "device_lane_ball": str(self.device_lane_ball),
+            "device_sam3d": str(self.device_sam3d),
             "initialized_at": self.initialized_at.isoformat(),
             "cuda_available": torch.cuda.is_available(),
         }
 
         # Append VRAM stats when running on CUDA
         if torch.cuda.is_available():
-            info["vram_allocated_mb"] = round(
-                torch.cuda.memory_allocated(self.device) / 1024 / 1024, 1
+            info["vram_lane_ball_allocated_mb"] = round(
+                torch.cuda.memory_allocated(self.device_lane_ball) / 1024 / 1024, 1
             )
-            info["vram_reserved_mb"] = round(
-                torch.cuda.memory_reserved(self.device) / 1024 / 1024, 1
+            info["vram_lane_ball_reserved_mb"] = round(
+                torch.cuda.memory_reserved(self.device_lane_ball) / 1024 / 1024, 1
             )
+            if self.device_lane_ball != self.device_sam3d:
+                info["vram_sam3d_allocated_mb"] = round(
+                    torch.cuda.memory_allocated(self.device_sam3d) / 1024 / 1024, 1
+                )
+                info["vram_sam3d_reserved_mb"] = round(
+                    torch.cuda.memory_reserved(self.device_sam3d) / 1024 / 1024, 1
+                )
 
         return info

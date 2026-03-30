@@ -16,6 +16,7 @@ class AppSettings:
     lane_ball_batch_size: int = 32
     sam3d_body_batch_size: int = 4
     lane_ball_start_frame: int = 10  # demo default — skip first N frames
+    multi_gpu: bool = False
 
 
 def _parse_bool(raw: str | None, *, default: bool) -> bool:
@@ -75,6 +76,8 @@ def load_app_settings() -> AppSettings:
     except ValueError:
         sam3d_bs = 4
 
+    multi_gpu = _parse_bool(_env("MULTI_GPU", default="false"), default=False)
+
     return AppSettings(
         api_base=_env("API_BASE", "api_base", default="https://api.revmetrix.io"),
         username=_env("API_USERNAME", "USERNAME", "username"),
@@ -86,4 +89,5 @@ def load_app_settings() -> AppSettings:
         presign_ttl_seconds=max(ttl, 1),
         lane_ball_batch_size=lb_bs,
         sam3d_body_batch_size=sam3d_bs,
+        multi_gpu=multi_gpu,
     )

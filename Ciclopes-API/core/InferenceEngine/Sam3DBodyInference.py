@@ -192,7 +192,7 @@ class Sam3DBodyInference:
             # img_ori is only needed for "full" inference (hand re-crop), not "body"
             stacked["img_ori"] = batches[0]["img_ori"]
 
-            stacked = recursive_to(stacked, "cuda")
+            stacked = recursive_to(stacked, self.device)
             self.model._initialize_batch(stacked)
 
             pose_output = self.model.forward_step(stacked, decoder_type="body")
