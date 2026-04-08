@@ -35,3 +35,4 @@ OPTIMIZATION_SUMMARY.md
 /pipeline_v2/.claude
 *.avi
 Ciclopes-API/.env
+Ciclopes-API/.codex
