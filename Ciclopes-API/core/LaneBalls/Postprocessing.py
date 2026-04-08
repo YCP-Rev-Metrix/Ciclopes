@@ -617,12 +617,13 @@ def _ball_contact_point_from_mask(ball_mask: np.ndarray) -> Optional[tuple[float
     if xs.size == 0:
         return None
 
-    y_contact = int(np.max(ys))
-    xs_at_contact = xs[ys == y_contact]
-    if xs_at_contact.size == 0:
-        return None
-    x_contact = float(np.mean(xs_at_contact))
-    return x_contact, float(y_contact)
+    # Use the bottom of the mask for y and the horizontal center of the full
+    # bounding box for x.  Using only xs at y == y_contact is fragile: the
+    # bottom-most row may contain just one or two pixels at a corner of the
+    # detection, shifting x away from the true bottom-middle.
+    y_contact = float(np.max(ys))
+    x_contact = float(np.min(xs) + np.max(xs)) / 2.0
+    return x_contact, y_contact
 
 
 def _choose_ball_contact_for_lane(

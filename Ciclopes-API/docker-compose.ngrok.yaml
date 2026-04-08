@@ -1,35 +1,10 @@
 services:
-  ngrok:
-    image: ngrok/ngrok:latest
-    container_name: ciclopes-ngrok
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: ciclopes-tunnel
     profiles:
       - ngrok
-    env_file:
-      - .env
     depends_on:
       - ciclopes-api
-    entrypoint:
-      - /bin/sh
-      - -ec
-    command:
-      - |
-        if [ -z "$${NGROK_AUTHTOKEN:-}" ]; then
-          echo "NGROK_AUTHTOKEN is required when the ngrok profile is enabled." >&2
-          exit 1
-        fi
-
-        TARGET="$${NGROK_UPSTREAM_URL:-http://ciclopes-api:8000}"
-        set -- http "$$TARGET" --authtoken "$$NGROK_AUTHTOKEN"
-
-        if [ -n "$${NGROK_URL:-}" ]; then
-          set -- "$$@" --url "$$NGROK_URL"
-        fi
-
-        if [ -n "$${NGROK_BASIC_AUTH:-}" ]; then
-          set -- "$$@" --basic-auth "$$NGROK_BASIC_AUTH"
-        fi
-
-        exec ngrok "$$@"
-    ports:
-      - "127.0.0.1:${NGROK_WEB_PORT:-4040}:4040"
+    command: tunnel --no-autoupdate --url http://ciclopes-api:8000
     restart: unless-stopped

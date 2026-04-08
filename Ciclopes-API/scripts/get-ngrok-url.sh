@@ -1,31 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-container_name="${1:-ciclopes-ngrok}"
+container_name="${1:-ciclopes-tunnel}"
 
-body="$(
-  docker exec "$container_name" bash -lc '
-    exec 3<>/dev/tcp/127.0.0.1/4040
-    printf "GET /api/tunnels HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" >&3
-    cat <&3
-  ' | awk 'BEGIN { body = 0 } body { print } /^\r?$/ { body = 1 }'
-)"
+for i in $(seq 1 30); do
+  url=$(docker logs "$container_name" 2>&1 | grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' | tail -1)
+  if [ -n "$url" ]; then
+    echo "$url"
+    exit 0
+  fi
+  sleep 1
+done
 
-python - <<'PY' "$body"
-import json
-import sys
-
-payload = json.loads(sys.argv[1])
-tunnels = payload.get("tunnels", [])
-
-https_url = next((t["public_url"] for t in tunnels if t.get("proto") == "https"), None)
-if https_url:
-    print(https_url)
-    raise SystemExit(0)
-
-if tunnels:
-    print(tunnels[0]["public_url"])
-    raise SystemExit(0)
-
-raise SystemExit("No ngrok tunnels found.")
-PY
+echo "Tunnel URL not found in logs after 30 seconds." >&2
+exit 1

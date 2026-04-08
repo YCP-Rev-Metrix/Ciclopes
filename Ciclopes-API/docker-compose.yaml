@@ -31,6 +31,10 @@ services:
       - HF_HOME=/root/.cache/huggingface
       - HF_TOKEN=${HF_TOKEN:-}
       - SAM3D_BODY_HF_REPO_ID=${SAM3D_BODY_HF_REPO_ID:-facebook/sam-3d-body-dinov3}
+      # RTX 5070 Ti (Blackwell): PyTorch nightly ships cu130 but the base image
+      # only registers cuda-12.4 libs in ldconfig. Prepend the 13.0 lib dir so
+      # the dynamic linker finds libnvrtc-builtins.so.13.0 for NVRTC JIT.
+      - LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
 
     # ── Ports ────────────────────────────────────────────────────────────────
     ports:
