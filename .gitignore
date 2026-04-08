@@ -30,7 +30,7 @@ OPTIMIZATION_SUMMARY.md
 /.claude
 /pipeline_v2/data
 /pipeline_v2/runs
-*.pt
+/pipeline_v2/*.pt
 *.mp4
 /pipeline_v2/.claude
 *.avi
