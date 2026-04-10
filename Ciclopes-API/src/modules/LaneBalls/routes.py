@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import sys
+import traceback
 
 import cv2
 from fastapi import APIRouter, HTTPException, Request
@@ -21,6 +23,17 @@ router = APIRouter(
     prefix="/laneballs",
     tags=["LaneBalls"],
 )
+
+
+def _empty_output(fps: float = 30.0) -> LaneBallRunOutput:
+    return LaneBallRunOutput(
+        fps=fps,
+        ball_points=[],
+        kinematics_table=[],
+        is_trapezoid=False,
+        homography_frame=None,
+        health=LaneBallHealthInfo(),
+    )
 
 
 def _get_engine(request: Request):
@@ -44,7 +57,22 @@ async def run_lane_ball_pipeline(request: Request, payload: LaneBallRunInput):
 
     This endpoint runs asynchronously, it does not block SAM3D Body or other concurrent requests because the GPU work is dispatched to a thread-pool executor inside InferenceEngine
     """
+    fps = 30.0
 
+    try:
+        return await _run_lane_ball_pipeline_inner(request, payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "UNHANDLED EXCEPTION in /laneballs/run:\n%s",
+            traceback.format_exc(),
+        )
+        sys.stdout.flush()
+        return _empty_output(fps=fps)
+
+
+async def _run_lane_ball_pipeline_inner(request: Request, payload: LaneBallRunInput) -> LaneBallRunOutput:
     engine = _get_engine(request)
     settings = _get_settings(request)
 
@@ -73,11 +101,8 @@ async def run_lane_ball_pipeline(request: Request, payload: LaneBallRunInput):
         split_video = split_video_into_frames(str(temp_path))
 
     if not split_video.frames:
-        return LaneBallRunOutput(
-            ball_points=[],
-            kinematics_table=[],
-            health=LaneBallHealthInfo(error="No frames extracted"),
-        )
+        logger.warning("No frames extracted for video_key=%s", payload.video_key)
+        return _empty_output()
 
     fps = float(split_video.fps) if split_video.fps > 0 else 30.0
     rgb_frames = [cv2.cvtColor(vf.image, cv2.COLOR_BGR2RGB) for vf in split_video.frames]
@@ -91,7 +116,7 @@ async def run_lane_ball_pipeline(request: Request, payload: LaneBallRunInput):
         )
     except Exception as exc:
         logger.exception("/laneballs/run pipeline failed")
-        raise HTTPException(status_code=500, detail=f"Pipeline error: {exc}")
+        return _empty_output(fps=fps)
 
     # ── Parse results ─────────────────────────────────────────────────────
     health_raw = lane_ball_output.get("health", {})

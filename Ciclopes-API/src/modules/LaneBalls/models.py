@@ -31,7 +31,6 @@ class LaneBallHealthInfo(BaseModel):
     mean_lane_coverage_ratio: float = 0.0
     inference_ms: float = 0.0
     postprocess_ms: float = 0.0
-    error: str | None = None
 
 
 class LaneBallRunOutput(BaseModel):

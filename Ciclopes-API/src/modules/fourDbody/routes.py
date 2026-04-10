@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import sys
+import traceback
 
 import cv2
 from fastapi import APIRouter, HTTPException, Request
@@ -43,7 +45,22 @@ async def run_sam3d_body_pipeline(request: Request, payload: Sam3DBodyRunInput):
 
     This endpoint runs asynchronously, it does not block lane-ball or other concurrent requests because the GPU work is dispatched to a thread-pool executor inside InferenceEngine
     """
+    fps = 30.0
 
+    try:
+        return await _run_sam3d_body_pipeline_inner(request, payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "UNHANDLED EXCEPTION in /fourdbody/run:\n%s",
+            traceback.format_exc(),
+        )
+        sys.stdout.flush()
+        return Sam3DBodyRunOutput(fps=fps, skeleton_points=[])
+
+
+async def _run_sam3d_body_pipeline_inner(request: Request, payload: Sam3DBodyRunInput) -> Sam3DBodyRunOutput:
     engine = _get_engine(request)
     settings = _get_settings(request)
 
@@ -85,7 +102,7 @@ async def run_sam3d_body_pipeline(request: Request, payload: Sam3DBodyRunInput):
         )
     except Exception as exc:
         logger.exception("/fourdbody/run pipeline failed")
-        raise HTTPException(status_code=500, detail=f"Pipeline error: {exc}")
+        return Sam3DBodyRunOutput(fps=fps, skeleton_points=[])
 
     # ── EMA smoothing to reduce jitter ────────────────────────────────────
     smoothed_output = ema_smooth_skeleton_frames(sam3d_output)

@@ -197,7 +197,47 @@ class InferenceEngine:
         raw_results = self.lane_ball.infer(frame)
         return LaneBallInference.extract_masks(raw_results)
 
+    @staticmethod
+    def _empty_lane_ball_result(**health_overrides: Any) -> dict[str, Any]:
+        health: dict[str, Any] = {
+            "inference_ms": 0.0,
+            "postprocess_ms": 0.0,
+            "frames_scanned_for_h": 0,
+            "frames_with_lane": 0,
+            "frames_with_ball": 0,
+            "lane_polygon_count_at_h": 0,
+            "homography_determinant": 0.0,
+            "homography_condition_number": 0.0,
+            "mean_lane_coverage_ratio": 0.0,
+        }
+        health.update(health_overrides)
+        return {
+            "positions": [],
+            "kinematics": {"quarters": []},
+            "is_trapezoid": False,
+            "homography_frame": None,
+            "homography_src_corners": [],
+            "homography_dst_corners_m": [],
+            "homography_matrix": [],
+            "health": health,
+        }
+
     def _run_lane_ball_pipeline_sync(
+        self, frames_rgb: list[np.ndarray], fps: float, start_frame: int,
+        batch_size: int = 32,
+    ) -> dict[str, Any]:
+        try:
+            return self._run_lane_ball_pipeline_sync_inner(
+                frames_rgb, fps, start_frame, batch_size,
+            )
+        except Exception:
+            logger.exception(
+                "FATAL: _run_lane_ball_pipeline_sync crashed — returning empty results"
+            )
+            import sys; sys.stdout.flush()
+            return self._empty_lane_ball_result()
+
+    def _run_lane_ball_pipeline_sync_inner(
         self, frames_rgb: list[np.ndarray], fps: float, start_frame: int,
         batch_size: int = 32,
     ) -> dict[str, Any]:
@@ -230,29 +270,13 @@ class InferenceEngine:
                     np.ascontiguousarray(frame[:, :, ::-1]) for frame in frames_rgb
                 ],
             )
-        except Exception as exc:
+        except Exception:
             logger.exception("Postprocessing failed — returning empty results")
             post_ms = (time.perf_counter() - post_t0) * 1000.0
-            return {
-                "positions": [],
-                "kinematics": {"quarters": []},
-                "is_trapezoid": False,
-                "homography_frame": None,
-                "homography_src_corners": [],
-                "homography_dst_corners_m": [],
-                "homography_matrix": [],
-                "health": {
-                    "inference_ms": round(inference_ms, 2),
-                    "postprocess_ms": round(post_ms, 2),
-                    "frames_scanned_for_h": 0,
-                    "frames_with_lane": 0,
-                    "frames_with_ball": 0,
-                    "lane_polygon_count_at_h": 0,
-                    "homography_determinant": 0.0,
-                    "homography_condition_number": 0.0,
-                    "mean_lane_coverage_ratio": 0.0,
-                },
-            }
+            return self._empty_lane_ball_result(
+                inference_ms=round(inference_ms, 2),
+                postprocess_ms=round(post_ms, 2),
+            )
         post_ms = (time.perf_counter() - post_t0) * 1000.0
 
         # ── Trim → Interpolate → Departure → Kinematics ─────────────────
