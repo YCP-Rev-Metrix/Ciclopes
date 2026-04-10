@@ -231,6 +231,7 @@ class InferenceEngine:
                 ],
             )
         except Exception as exc:
+            logger.exception("Postprocessing failed — returning empty results")
             post_ms = (time.perf_counter() - post_t0) * 1000.0
             return {
                 "positions": [],
@@ -241,7 +242,6 @@ class InferenceEngine:
                 "homography_dst_corners_m": [],
                 "homography_matrix": [],
                 "health": {
-                    "error": str(exc),
                     "inference_ms": round(inference_ms, 2),
                     "postprocess_ms": round(post_ms, 2),
                     "frames_scanned_for_h": 0,

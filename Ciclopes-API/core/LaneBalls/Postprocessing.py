@@ -766,12 +766,36 @@ def run_lane_ball_postprocessing(
     frames_bgr: Optional[Sequence[np.ndarray]] = None,
     min_trapezoid_score: float = DEFAULT_MIN_TRAPEZOID_SCORE,
 ) -> PostprocessResult:
+    def _empty_result(scanned: int = 0, with_lane: int = 0, coverage: float = 0.0) -> PostprocessResult:
+        return PostprocessResult(
+            ball_positions=BallPosList(ball_positions=[]),
+            homography_selection=HomographySelection(
+                frame_index=start_frame,
+                homography=np.eye(3, dtype=np.float32),
+                src_corners=np.zeros((4, 2), dtype=np.float32),
+                dst_corners=np.zeros((4, 2), dtype=np.float32),
+                is_trapezoid=False,
+                selected_lane_contours=0,
+            ),
+            health=PostprocessHealth(
+                frames_scanned_for_h=scanned,
+                frames_with_lane=with_lane,
+                frames_with_ball=0,
+                lane_polygon_count_at_h=0,
+                homography_determinant=0.0,
+                homography_condition_number=0.0,
+                mean_lane_coverage_ratio=coverage,
+            ),
+        )
+
     if not segmentations_by_frame:
-        raise ValueError("No segmentations provided")
+        logger.warning("No segmentations provided — returning empty results")
+        return _empty_result()
 
     sorted_frames = sorted(k for k in segmentations_by_frame.keys() if k >= start_frame)
     if not sorted_frames:
-        raise ValueError(f"No frames >= start_frame={start_frame}")
+        logger.warning("No frames >= start_frame=%d — returning empty results", start_frame)
+        return _empty_result()
 
     smoother = TemporalSmoother()
     coverage_values: List[float] = []
@@ -829,26 +853,10 @@ def run_lane_ball_postprocessing(
             "No active lane found from start_frame=%d — returning empty results",
             start_frame,
         )
-        empty_h = np.eye(3, dtype=np.float32)
-        return PostprocessResult(
-            ball_positions=BallPosList(ball_positions=[]),
-            homography_selection=HomographySelection(
-                frame_index=start_frame,
-                homography=empty_h,
-                src_corners=np.zeros((4, 2), dtype=np.float32),
-                dst_corners=np.zeros((4, 2), dtype=np.float32),
-                is_trapezoid=False,
-                selected_lane_contours=0,
-            ),
-            health=PostprocessHealth(
-                frames_scanned_for_h=int(scanned),
-                frames_with_lane=int(frames_with_lane),
-                frames_with_ball=0,
-                lane_polygon_count_at_h=0,
-                homography_determinant=0.0,
-                homography_condition_number=0.0,
-                mean_lane_coverage_ratio=float(np.mean(coverage_values)) if coverage_values else 0.0,
-            ),
+        return _empty_result(
+            scanned=scanned,
+            with_lane=frames_with_lane,
+            coverage=float(np.mean(coverage_values)) if coverage_values else 0.0,
         )
 
     logger.info(

@@ -95,9 +95,6 @@ async def run_lane_ball_pipeline(request: Request, payload: LaneBallRunInput):
 
     # ── Parse results ─────────────────────────────────────────────────────
     health_raw = lane_ball_output.get("health", {})
-    pipeline_error = health_raw.get("error")
-    if pipeline_error:
-        raise HTTPException(status_code=500, detail=str(pipeline_error))
 
     positions = lane_ball_output.get("positions", [])
     quarters = lane_ball_output.get("kinematics", {}).get("quarters", [])
