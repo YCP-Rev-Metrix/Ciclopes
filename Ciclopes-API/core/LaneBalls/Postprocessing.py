@@ -825,9 +825,30 @@ def run_lane_ball_postprocessing(
 
     active_lane = smoother.select_active_lane()
     if active_lane is None:
-        raise RuntimeError(
-            "Failed to select an active lane from segmentations "
-            f"from start_frame={start_frame}"
+        logger.warning(
+            "No active lane found from start_frame=%d — returning empty results",
+            start_frame,
+        )
+        empty_h = np.eye(3, dtype=np.float32)
+        return PostprocessResult(
+            ball_positions=BallPosList(ball_positions=[]),
+            homography_selection=HomographySelection(
+                frame_index=start_frame,
+                homography=empty_h,
+                src_corners=np.zeros((4, 2), dtype=np.float32),
+                dst_corners=np.zeros((4, 2), dtype=np.float32),
+                is_trapezoid=False,
+                selected_lane_contours=0,
+            ),
+            health=PostprocessHealth(
+                frames_scanned_for_h=int(scanned),
+                frames_with_lane=int(frames_with_lane),
+                frames_with_ball=0,
+                lane_polygon_count_at_h=0,
+                homography_determinant=0.0,
+                homography_condition_number=0.0,
+                mean_lane_coverage_ratio=float(np.mean(coverage_values)) if coverage_values else 0.0,
+            ),
         )
 
     logger.info(
