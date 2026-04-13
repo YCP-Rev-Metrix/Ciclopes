@@ -6,8 +6,9 @@ import traceback
 
 import cv2
 from fastapi import APIRouter, HTTPException, Request
+from core.SensorData.sensor_parser import compute_ball_contact_frame
 from core.VideoUtil.FrameSplit import split_video_into_frames
-from core.VideoUtil.SpacesApiClient import query_video_via_api_to_temp_file
+from core.VideoUtil.SpacesApiClient import query_json_via_api, query_video_via_api_to_temp_file
 
 from src.modules.LaneBalls.models import (
     BallPoint,
@@ -115,11 +116,35 @@ async def _run_lane_ball_pipeline_inner(request: Request, payload: LaneBallRunIn
     split_video.frames.clear()
     del split_video
 
+    # ── Determine start frame from sensor data (or use default) ───────────
+    lb_start_frame = settings.lane_ball_start_frame
+    if payload.sd_key != "key":
+        logger.info("Fetching sensor JSON from bucket: sd_key=%s", payload.sd_key)
+        try:
+            sensor_data = query_json_via_api(
+                base=settings.api_base,
+                verify_api=settings.verify_api,
+                username=settings.username,
+                password=settings.password,
+                key=payload.sd_key,
+                ttl_seconds=settings.presign_ttl_seconds,
+                verify_presigned=settings.verify_presigned,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Sensor JSON query failed: {exc}")
+
+        sensor_info = compute_ball_contact_frame(sensor_data, fps)
+        if sensor_info is not None:
+            lb_start_frame = sensor_info.ball_contact_frame
+            logger.info("Sensor-derived laneball start_frame=%d", lb_start_frame)
+        else:
+            logger.warning("Could not parse sensor data; falling back to default start_frame")
+
     try:
         lane_ball_output = await engine.forward_lane_ball(
             frames_rgb=rgb_frames,
             fps=fps,
-            start_frame=settings.lane_ball_start_frame,
+            start_frame=lb_start_frame,
             batch_size=settings.lane_ball_batch_size,
         )
     except Exception as exc:

@@ -16,11 +16,12 @@ AI Generated -- needs verified / cleaned
 
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Any, Dict, Iterator, Optional
 
 import requests
 
@@ -196,3 +197,38 @@ def query_video_via_api_to_temp_file(
         )
         yield temp_path
 
+
+def query_json_via_api(
+    *,
+    base: str,
+    verify_api: bool,
+    username: str,
+    password: str,
+    key: str,
+    ttl_seconds: int = 600,
+    verify_presigned: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """
+    Fetch a JSON object from the bucket using authorize -> presign -> download,
+    returning the parsed dict directly (no temp file needed).
+    """
+    token = authorize(
+        base=base,
+        verify=verify_api,
+        username=username,
+        password=password,
+    )
+    presigned_url = get_presigned_url(
+        base=base,
+        verify=verify_api,
+        token=token,
+        key=key,
+        ttl_seconds=ttl_seconds,
+    )
+    kwargs: dict = {"timeout": 60}
+    if verify_presigned is not None:
+        kwargs["verify"] = verify_presigned
+    resp = requests.get(presigned_url, **kwargs)
+    if resp.status_code != 200:
+        raise SpacesApiError(f"JSON download failed: status={resp.status_code}, body={resp.text}")
+    return resp.json()

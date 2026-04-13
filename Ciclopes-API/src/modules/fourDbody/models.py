@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 class Sam3DBodyRunInput(BaseModel):
     video_key: str = Field(..., description="Object key for input video in bucket")
+    sd_key: str = Field("key", description="Sensor data key in bucket; 'key' = test mode (use all frames)")
 
 
 class SkeletonPoint(BaseModel):

@@ -6,6 +6,7 @@ import logging
 import cv2
 from fastapi import APIRouter, HTTPException, Request
 
+from core.SensorData.sensor_parser import compute_ball_contact_frame
 from src.modules.Aggregated.models import AggRunInput, AggRunOutput, BallPoint, KinematicsRow, SkeletonPoint
 
 logger = logging.getLogger("ciclopes.aggregated_routes")
@@ -72,15 +73,52 @@ async def run_aggregate_pipeline(request: Request, payload: AggRunInput):
     fps = float(split_video.fps) if split_video.fps > 0 else 30.0
     rgb_frames = [cv2.cvtColor(vf.image, cv2.COLOR_BGR2RGB) for vf in split_video.frames]
 
+    # ── Determine frame ranges from sensor data (or use defaults) ─────────
+    use_sensor = payload.sd_key != "key"
+    lb_start_frame = settings.lane_ball_start_frame
+    fourdbody_frames = rgb_frames
+
+    if use_sensor:
+        from core.VideoUtil.SpacesApiClient import query_json_via_api
+
+        logger.info("Fetching sensor JSON from bucket: sd_key=%s", payload.sd_key)
+        try:
+            sensor_data = query_json_via_api(
+                base=settings.api_base,
+                verify_api=settings.verify_api,
+                username=settings.username,
+                password=settings.password,
+                key=payload.sd_key,
+                ttl_seconds=settings.presign_ttl_seconds,
+                verify_presigned=settings.verify_presigned,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Sensor JSON query failed: {exc}")
+
+        sensor_info = compute_ball_contact_frame(sensor_data, fps)
+        if sensor_info is not None:
+            lb_start_frame = sensor_info.ball_contact_frame
+            # fourdbody: from start up to 1 second after ball contact
+            fourdbody_end = sensor_info.ball_contact_frame + int(fps)
+            fourdbody_frames = rgb_frames[:fourdbody_end]
+            logger.info(
+                "Sensor-derived frames: laneball_start=%d  fourdbody_end=%d (of %d total)",
+                lb_start_frame,
+                fourdbody_end,
+                len(rgb_frames),
+            )
+        else:
+            logger.warning("Could not parse sensor data; falling back to defaults")
+
     # Run both pipelines concurrently — they use separate thread-pool slots.
     lane_ball_coro = engine.forward_lane_ball(
         frames_rgb=rgb_frames,
         fps=fps,
-        start_frame=settings.lane_ball_start_frame,
+        start_frame=lb_start_frame,
         batch_size=settings.lane_ball_batch_size,
     )
     sam3d_coro = engine.forward_sam3d_body(
-        frames_rgb=rgb_frames,
+        frames_rgb=fourdbody_frames,
         batch_size=settings.sam3d_body_batch_size,
     )
 

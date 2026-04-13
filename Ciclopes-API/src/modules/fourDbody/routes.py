@@ -9,12 +9,14 @@ from fastapi import APIRouter, HTTPException, Request
 
 import importlib as _il
 
-from src.modules.fourDbody.models import Sam3DBodyRunInput, Sam3DBodyRunOutput, SkeletonPoint
+from core.SensorData.sensor_parser import compute_ball_contact_frame
 from core.VideoUtil.FrameSplit import split_video_into_frames
+
+from src.modules.fourDbody.models import Sam3DBodyRunInput, Sam3DBodyRunOutput, SkeletonPoint
 
 _ema_mod = _il.import_module("core.4DBody.emaSmoothing")
 ema_smooth_skeleton_frames = _ema_mod.ema_smooth_skeleton_frames
-from core.VideoUtil.SpacesApiClient import query_video_via_api_to_temp_file
+from core.VideoUtil.SpacesApiClient import query_json_via_api, query_video_via_api_to_temp_file
 
 logger = logging.getLogger("ciclopes.fourdbody_routes")
 
@@ -103,9 +105,38 @@ async def _run_sam3d_body_pipeline_inner(request: Request, payload: Sam3DBodyRun
     split_video.frames.clear()
     del split_video
 
+    # ── Determine frame range from sensor data (or use all frames) ────────
+    fourdbody_frames = rgb_frames
+    if payload.sd_key != "key":
+        logger.info("Fetching sensor JSON from bucket: sd_key=%s", payload.sd_key)
+        try:
+            sensor_data = query_json_via_api(
+                base=settings.api_base,
+                verify_api=settings.verify_api,
+                username=settings.username,
+                password=settings.password,
+                key=payload.sd_key,
+                ttl_seconds=settings.presign_ttl_seconds,
+                verify_presigned=settings.verify_presigned,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Sensor JSON query failed: {exc}")
+
+        sensor_info = compute_ball_contact_frame(sensor_data, fps)
+        if sensor_info is not None:
+            fourdbody_end = sensor_info.ball_contact_frame + int(fps)
+            fourdbody_frames = rgb_frames[:fourdbody_end]
+            logger.info(
+                "Sensor-derived fourdbody_end=%d (of %d total)",
+                fourdbody_end,
+                len(rgb_frames),
+            )
+        else:
+            logger.warning("Could not parse sensor data; falling back to all frames")
+
     try:
         sam3d_output = await engine.forward_sam3d_body(
-            frames_rgb=rgb_frames,
+            frames_rgb=fourdbody_frames,
             batch_size=settings.sam3d_body_batch_size,
         )
     except Exception as exc:
