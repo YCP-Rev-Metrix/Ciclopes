@@ -164,6 +164,8 @@ class InferenceEngine:
         t0 = time.perf_counter()
 
         batch_results = self.sam3d_body.infer_batch(frames_rgb, batch_size=batch_size)
+        # Free input frames now that inference is done
+        frames_rgb.clear()
 
         all_frames: list[list[dict[str, Any]]] = []
         for frame_persons in batch_results:
@@ -247,6 +249,7 @@ class InferenceEngine:
         for i in range(0, len(frames_rgb), batch_size):
             chunk = frames_rgb[i : i + batch_size]
             raw_results.extend(self.lane_ball.infer_batch(chunk))
+            torch.cuda.empty_cache()
         inference_ms = (time.perf_counter() - inference_t0) * 1000.0
 
         segmentations_by_frame = {
@@ -260,15 +263,20 @@ class InferenceEngine:
             len(segmentations_by_frame), total_ball_masks, total_lane_masks,
         )
 
+        # Build BGR copies for postprocessing (trapezoid refinement needs pixel data)
+        frames_bgr = [
+            np.ascontiguousarray(frame[:, :, ::-1]) for frame in frames_rgb
+        ]
+        # Free the RGB copies — postprocessing only uses BGR
+        frames_rgb.clear()
+
         post_t0 = time.perf_counter()
         try:
             post = run_lane_ball_postprocessing(
                 segmentations_by_frame=segmentations_by_frame,
                 fps=fps,
                 start_frame=start_frame,
-                frames_bgr=[
-                    np.ascontiguousarray(frame[:, :, ::-1]) for frame in frames_rgb
-                ],
+                frames_bgr=frames_bgr,
             )
         except Exception:
             logger.exception("Postprocessing failed — returning empty results")
@@ -277,6 +285,9 @@ class InferenceEngine:
                 inference_ms=round(inference_ms, 2),
                 postprocess_ms=round(post_ms, 2),
             )
+        finally:
+            frames_bgr.clear()
+            del frames_bgr
         post_ms = (time.perf_counter() - post_t0) * 1000.0
 
         # ── Trim → Interpolate → Departure → Kinematics ─────────────────

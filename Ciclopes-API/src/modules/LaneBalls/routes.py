@@ -98,7 +98,11 @@ async def _run_lane_ball_pipeline_inner(request: Request, payload: LaneBallRunIn
         raise HTTPException(status_code=502, detail=f"Video query failed: {exc}")
 
     with temp_ctx as temp_path:
-        split_video = split_video_into_frames(str(temp_path))
+        split_video = split_video_into_frames(
+            str(temp_path),
+            max_frames=settings.max_video_frames,
+            max_dimension=settings.max_video_dimension,
+        )
 
     if not split_video.frames:
         logger.warning("No frames extracted for video_key=%s", payload.video_key)
@@ -106,6 +110,10 @@ async def _run_lane_ball_pipeline_inner(request: Request, payload: LaneBallRunIn
 
     fps = float(split_video.fps) if split_video.fps > 0 else 30.0
     rgb_frames = [cv2.cvtColor(vf.image, cv2.COLOR_BGR2RGB) for vf in split_video.frames]
+
+    # Free the raw BGR frames — we only need rgb_frames from here on
+    split_video.frames.clear()
+    del split_video
 
     try:
         lane_ball_output = await engine.forward_lane_ball(
@@ -117,6 +125,9 @@ async def _run_lane_ball_pipeline_inner(request: Request, payload: LaneBallRunIn
     except Exception as exc:
         logger.exception("/laneballs/run pipeline failed")
         return _empty_output(fps=fps)
+    finally:
+        rgb_frames.clear()
+        del rgb_frames
 
     # ── Parse results ─────────────────────────────────────────────────────
     health_raw = lane_ball_output.get("health", {})

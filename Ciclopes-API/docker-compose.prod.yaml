@@ -17,6 +17,10 @@ services:
               count: all
               capabilities: [gpu]
 
+    # ── Memory limits (OOM protection — fail gracefully instead of kernel SIGKILL) ─
+    mem_limit: 24g
+    memswap_limit: 24g
+
     # ── Shared memory for PyTorch (dataloader multiprocessing) ───────────────
     shm_size: '8gb'
 

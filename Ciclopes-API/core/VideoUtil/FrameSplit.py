@@ -1,10 +1,35 @@
 from core.VideoUtil.models import SplitVideo, VideoFrame
 from typing import List, Optional, Union
+import logging
 import torch
 import cv2
 import numpy as np
 
-def split_video_into_frames(video_path: str) -> SplitVideo:
+logger = logging.getLogger("ciclopes.frame_split")
+
+# ── Defaults for OOM protection ─────────────────────────────────────────────
+DEFAULT_MAX_FRAMES = 600        # ~20 s at 30 fps
+DEFAULT_MAX_DIMENSION = 1024    # inference resolution cap
+
+
+def _resize_if_needed(frame: np.ndarray, max_dim: int) -> np.ndarray:
+    """Down-scale so the longest edge is <= max_dim. No-op if already small."""
+    h, w = frame.shape[:2]
+    longest = max(h, w)
+    if longest <= max_dim:
+        return frame
+    scale = max_dim / longest
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def split_video_into_frames(
+    video_path: str,
+    *,
+    max_frames: int = DEFAULT_MAX_FRAMES,
+    max_dimension: int = DEFAULT_MAX_DIMENSION,
+) -> SplitVideo:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise FileNotFoundError(f"Could not open video at path: {video_path}")
@@ -12,22 +37,40 @@ def split_video_into_frames(video_path: str) -> SplitVideo:
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-    split_video = SplitVideo(fps=fps, width=width, height=height)
+    # Compute step to sub-sample if the video has more frames than the cap
+    step = max(1, total_frames // max_frames) if total_frames > max_frames else 1
+    effective_fps = fps / step if step > 1 else fps
+
+    logger.info(
+        "Video %s: %dx%d @ %.1f fps, %d total frames → step=%d (max_frames=%d, max_dim=%d)",
+        video_path, width, height, fps, total_frames, step, max_frames, max_dimension,
+    )
+
+    split_video = SplitVideo(fps=effective_fps, width=width, height=height)
 
     frame_index = 0
+    kept = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        timestamp_s = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
-        split_video.add_frame(
-            VideoFrame(frame_index=frame_index, timestamp=timestamp_s, image=frame)
-        )
+        if frame_index % step == 0:
+            frame = _resize_if_needed(frame, max_dimension)
+            timestamp_s = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
+            split_video.add_frame(
+                VideoFrame(frame_index=kept, timestamp=timestamp_s, image=frame)
+            )
+            kept += 1
+            if kept >= max_frames:
+                break
+
         frame_index += 1
 
     cap.release()
+    logger.info("Extracted %d frames (resized to max_dim=%d)", kept, max_dimension)
     return split_video
 
 def _frames_to_tensor_batch(
