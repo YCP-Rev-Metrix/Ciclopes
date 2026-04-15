@@ -10,10 +10,15 @@ from core.SensorData.sensor_parser import compute_ball_contact_frame
 from core.VideoUtil.FrameSplit import split_video_into_frames
 from core.VideoUtil.SpacesApiClient import query_json_via_api, query_video_via_api_to_temp_file
 
+from core.LaneBalls.Kinematics import compute_kinematics_per_quarter
+from core.LaneBalls.models import BallPos
+from core.MockDB.mock_db_reader import load_shots
 from src.modules.LaneBalls.models import (
     BallPoint,
     KinematicsRow,
     LaneBallHealthInfo,
+    LaneBallQueryInput,
+    LaneBallQueryOutput,
     LaneBallRunInput,
     LaneBallRunOutput,
 )
@@ -197,3 +202,45 @@ async def _run_lane_ball_pipeline_inner(request: Request, payload: LaneBallRunIn
         homography_frame=lane_ball_output.get("homography_frame"),
         health=health,
     )
+
+
+@router.post("/query", response_model=LaneBallQueryOutput)
+async def query_lane_ball_shots(payload: LaneBallQueryInput):
+    """
+    Return saved lane-ball data for one or more shot numbers from the mock DB.
+    Missing shot numbers are silently omitted from the response.
+    """
+    records = load_shots("laneballs", payload.shot_numbers)
+
+    shots: dict[int, LaneBallRunOutput] = {}
+    for shot_number, rec in records.items():
+        fps = rec.get("fps", 30.0)
+        raw_positions = rec.get("ball_positions", [])
+
+        ball_points = [BallPoint(x=p["x"], y=p["y"]) for p in raw_positions]
+
+        ball_pos_objs = [
+            BallPos(frame_index=i, timestamp_s=i / fps, x_m=p["x"], y_m=p["y"])
+            for i, p in enumerate(raw_positions)
+        ]
+        kinematics = compute_kinematics_per_quarter(ball_pos_objs)
+        kinematics_table = [
+            KinematicsRow(
+                quarter=q.quarter,
+                start_m=q.start_m,
+                end_m=q.end_m,
+                mean_speed_mps=q.mean_speed_mps,
+                mean_acceleration_mps2=q.mean_acceleration_mps2,
+                sample_count=q.sample_count,
+            )
+            for q in kinematics.quarters
+        ]
+
+        shots[shot_number] = LaneBallRunOutput(
+            fps=fps,
+            ball_points=ball_points,
+            kinematics_table=kinematics_table,
+            health=LaneBallHealthInfo(),
+        )
+
+    return LaneBallQueryOutput(shots=shots)

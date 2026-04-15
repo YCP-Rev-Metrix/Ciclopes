@@ -18,3 +18,11 @@ class SkeletonPoint(BaseModel):
 class Sam3DBodyRunOutput(BaseModel):
     fps: float = Field(..., description="Source video frame rate — use for playback speed on the frontend")
     skeleton_points: list[list[SkeletonPoint]]
+
+
+class Sam3DBodyQueryInput(BaseModel):
+    shot_numbers: list[int] = Field(..., description="Shot numbers to retrieve from the mock DB")
+
+
+class Sam3DBodyQueryOutput(BaseModel):
+    shots: dict[int, Sam3DBodyRunOutput]

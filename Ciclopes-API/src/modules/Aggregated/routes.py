@@ -6,8 +6,19 @@ import logging
 import cv2
 from fastapi import APIRouter, HTTPException, Request
 
+from core.LaneBalls.Kinematics import compute_kinematics_per_quarter
+from core.LaneBalls.models import BallPos
+from core.MockDB.mock_db_reader import load_shots
 from core.SensorData.sensor_parser import compute_ball_contact_frame
-from src.modules.Aggregated.models import AggRunInput, AggRunOutput, BallPoint, KinematicsRow, SkeletonPoint
+from src.modules.Aggregated.models import (
+    AggQueryInput,
+    AggQueryOutput,
+    AggRunInput,
+    AggRunOutput,
+    BallPoint,
+    KinematicsRow,
+    SkeletonPoint,
+)
 
 logger = logging.getLogger("ciclopes.aggregated_routes")
 
@@ -176,3 +187,56 @@ async def run_aggregate_pipeline(request: Request, payload: AggRunInput):
         kinematics_table=kinematics_table,
         skeleton_points=skeleton_points,
     )
+
+
+@router.post("/query", response_model=AggQueryOutput)
+async def query_aggregated_shots(payload: AggQueryInput):
+    """
+    Return saved lane-ball and pose data for one or more shot numbers from the mock DB.
+    Pulls from the aggregated mock-DB files. Missing shot numbers are silently omitted.
+    """
+    records = load_shots("aggregated", payload.shot_numbers)
+
+    shots: dict[int, AggRunOutput] = {}
+    for shot_number, rec in records.items():
+        fps = rec.get("fps", 30.0)
+        raw_positions = rec.get("ball_positions", [])
+
+        ball_points = [BallPoint(x=p["x"], y=p["y"]) for p in raw_positions]
+
+        ball_pos_objs = [
+            BallPos(frame_index=i, timestamp_s=i / fps, x_m=p["x"], y_m=p["y"])
+            for i, p in enumerate(raw_positions)
+        ]
+        kinematics = compute_kinematics_per_quarter(ball_pos_objs)
+        kinematics_table = [
+            KinematicsRow(
+                quarter=q.quarter,
+                start_m=q.start_m,
+                end_m=q.end_m,
+                mean_speed_mps=q.mean_speed_mps,
+                mean_acceleration_mps2=q.mean_acceleration_mps2,
+                sample_count=q.sample_count,
+            )
+            for q in kinematics.quarters
+        ]
+
+        skeleton_points = [
+            [
+                SkeletonPoint(
+                    joint_id=j["joint_id"],
+                    x=j["x"],
+                    y=j["y"],
+                    z=j["z"],
+                )
+                for j in frame
+            ]
+            for frame in rec.get("skeleton_frames", [])
+        ]
+        shots[shot_number] = AggRunOutput(
+            ball_points=ball_points,
+            kinematics_table=kinematics_table,
+            skeleton_points=skeleton_points,
+        )
+
+    return AggQueryOutput(shots=shots)

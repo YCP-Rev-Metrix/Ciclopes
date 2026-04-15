@@ -41,3 +41,11 @@ class LaneBallRunOutput(BaseModel):
     is_trapezoid: bool = False
     homography_frame: int | None = None
     health: LaneBallHealthInfo
+
+
+class LaneBallQueryInput(BaseModel):
+    shot_numbers: list[int] = Field(..., description="Shot numbers to retrieve from the mock DB")
+
+
+class LaneBallQueryOutput(BaseModel):
+    shots: dict[int, LaneBallRunOutput]

@@ -33,3 +33,11 @@ class AggRunOutput(BaseModel):
     ball_points: list[BallPoint]
     kinematics_table: list[KinematicsRow]
     skeleton_points: list[list[SkeletonPoint]]
+
+
+class AggQueryInput(BaseModel):
+    shot_numbers: list[int] = Field(..., description="Shot numbers to retrieve from the mock DB")
+
+
+class AggQueryOutput(BaseModel):
+    shots: dict[int, AggRunOutput]

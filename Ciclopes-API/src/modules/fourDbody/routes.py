@@ -12,10 +12,17 @@ import importlib as _il
 from core.SensorData.sensor_parser import compute_ball_contact_frame
 from core.VideoUtil.FrameSplit import split_video_into_frames
 
-from src.modules.fourDbody.models import Sam3DBodyRunInput, Sam3DBodyRunOutput, SkeletonPoint
+from src.modules.fourDbody.models import (
+    Sam3DBodyQueryInput,
+    Sam3DBodyQueryOutput,
+    Sam3DBodyRunInput,
+    Sam3DBodyRunOutput,
+    SkeletonPoint,
+)
 
 _ema_mod = _il.import_module("core.4DBody.emaSmoothing")
 ema_smooth_skeleton_frames = _ema_mod.ema_smooth_skeleton_frames
+from core.MockDB.mock_db_reader import load_shots
 from core.VideoUtil.SpacesApiClient import query_json_via_api, query_video_via_api_to_temp_file
 
 logger = logging.getLogger("ciclopes.fourdbody_routes")
@@ -164,3 +171,33 @@ async def _run_sam3d_body_pipeline_inner(request: Request, payload: Sam3DBodyRun
     ]
 
     return Sam3DBodyRunOutput(fps=fps, skeleton_points=skeleton_points)
+
+
+@router.post("/query", response_model=Sam3DBodyQueryOutput)
+async def query_sam3d_body_shots(payload: Sam3DBodyQueryInput):
+    """
+    Return saved pose data for one or more shot numbers from the mock DB.
+    Missing shot numbers are silently omitted from the response.
+    """
+    records = load_shots("fourdbody", payload.shot_numbers)
+
+    shots: dict[int, Sam3DBodyRunOutput] = {}
+    for shot_number, rec in records.items():
+        skeleton_points = [
+            [
+                SkeletonPoint(
+                    joint_id=j["joint_id"],
+                    x=j["x"],
+                    y=j["y"],
+                    z=j["z"],
+                )
+                for j in frame
+            ]
+            for frame in rec.get("skeleton_frames", [])
+        ]
+        shots[shot_number] = Sam3DBodyRunOutput(
+            fps=rec.get("fps", 30.0),
+            skeleton_points=skeleton_points,
+        )
+
+    return Sam3DBodyQueryOutput(shots=shots)
