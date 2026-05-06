@@ -22,7 +22,8 @@ from src.modules.fourDbody.models import (
 
 _ema_mod = _il.import_module("core.4DBody.emaSmoothing")
 ema_smooth_skeleton_frames = _ema_mod.ema_smooth_skeleton_frames
-from core.MockDB.mock_db_reader import load_shots
+from core.MockDB.mock_db_reader import load_named_runs, load_shots
+from core.MockDB.mock_db_writer import default_run_name, save_named_run_section
 from core.VideoUtil.SpacesApiClient import query_json_via_api, query_video_via_api_to_temp_file
 
 logger = logging.getLogger("ciclopes.fourdbody_routes")
@@ -45,6 +46,12 @@ def _get_settings(request: Request):
     if settings is None:
         raise HTTPException(status_code=503, detail="Application settings are not initialized")
     return settings
+
+
+def _model_to_dict(model):
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
 
 
 @router.post("/run", response_model=Sam3DBodyRunOutput)
@@ -170,7 +177,19 @@ async def _run_sam3d_body_pipeline_inner(request: Request, payload: Sam3DBodyRun
         for frame_joints in smoothed_output
     ]
 
-    return Sam3DBodyRunOutput(fps=fps, skeleton_points=skeleton_points)
+    output = Sam3DBodyRunOutput(fps=fps, skeleton_points=skeleton_points)
+    run_name = payload.save_name or default_run_name(payload.video_key)
+    try:
+        save_named_run_section(
+            name=run_name,
+            section="fourdbody",
+            response=_model_to_dict(output),
+            video_key=payload.video_key,
+            sd_key=payload.sd_key,
+        )
+    except Exception:
+        logger.exception("Failed to save fourdbody run name=%s", run_name)
+    return output
 
 
 @router.post("/query", response_model=Sam3DBodyQueryOutput)
@@ -200,4 +219,14 @@ async def query_sam3d_body_shots(payload: Sam3DBodyQueryInput):
             skeleton_points=skeleton_points,
         )
 
-    return Sam3DBodyQueryOutput(shots=shots)
+    runs: dict[str, Sam3DBodyRunOutput] = {}
+    for name, rec in load_named_runs(payload.names).items():
+        section = rec.get("sections", {}).get("fourdbody")
+        if not section:
+            continue
+        try:
+            runs[name] = Sam3DBodyRunOutput(**section)
+        except Exception:
+            logger.exception("Failed to parse saved fourdbody section for name=%s", name)
+
+    return Sam3DBodyQueryOutput(shots=shots, runs=runs)

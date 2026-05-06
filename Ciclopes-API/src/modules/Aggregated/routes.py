@@ -8,7 +8,8 @@ from fastapi import APIRouter, HTTPException, Request
 
 from core.LaneBalls.Kinematics import compute_kinematics_per_quarter
 from core.LaneBalls.models import BallPos
-from core.MockDB.mock_db_reader import load_shots
+from core.MockDB.mock_db_reader import load_named_runs, load_shots
+from core.MockDB.mock_db_writer import default_run_name, save_named_run_section
 from core.SensorData.sensor_parser import compute_ball_contact_frame
 from src.modules.Aggregated.models import (
     AggQueryInput,
@@ -40,6 +41,12 @@ def _get_settings(request: Request):
     if settings is None:
         raise HTTPException(status_code=503, detail="Application settings are not initialized")
     return settings
+
+
+def _model_to_dict(model):
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
 
 
 @router.post("/run", response_model=AggRunOutput)
@@ -182,11 +189,50 @@ async def run_aggregate_pipeline(request: Request, payload: AggRunInput):
         for frame_joints in sam3d_output
     ]
 
-    return AggRunOutput(
+    output = AggRunOutput(
         ball_points=ball_points,
         kinematics_table=kinematics_table,
         skeleton_points=skeleton_points,
     )
+    run_name = payload.save_name or default_run_name(payload.video_key)
+    try:
+        save_named_run_section(
+            name=run_name,
+            section="aggregated",
+            response=_model_to_dict(output),
+            video_key=payload.video_key,
+            sd_key=payload.sd_key,
+        )
+        save_named_run_section(
+            name=run_name,
+            section="laneballs",
+            response={
+                "fps": fps,
+                "ball_points": [point.dict() if hasattr(point, "dict") else point for point in ball_points],
+                "kinematics_table": [row.dict() if hasattr(row, "dict") else row for row in kinematics_table],
+                "is_trapezoid": bool(lane_ball_output.get("is_trapezoid", False)),
+                "homography_frame": lane_ball_output.get("homography_frame"),
+                "health": health,
+            },
+            video_key=payload.video_key,
+            sd_key=payload.sd_key,
+        )
+        save_named_run_section(
+            name=run_name,
+            section="fourdbody",
+            response={
+                "fps": fps,
+                "skeleton_points": [
+                    [joint.dict() if hasattr(joint, "dict") else joint for joint in frame]
+                    for frame in skeleton_points
+                ],
+            },
+            video_key=payload.video_key,
+            sd_key=payload.sd_key,
+        )
+    except Exception:
+        logger.exception("Failed to save aggregate run name=%s", run_name)
+    return output
 
 
 @router.post("/query", response_model=AggQueryOutput)
@@ -239,4 +285,52 @@ async def query_aggregated_shots(payload: AggQueryInput):
             skeleton_points=skeleton_points,
         )
 
-    return AggQueryOutput(shots=shots)
+    runs: dict[str, AggRunOutput] = {}
+    for name, rec in load_named_runs(payload.names).items():
+        sections = rec.get("sections", {})
+        section = sections.get("aggregated")
+        if section:
+            try:
+                runs[name] = AggRunOutput(**section)
+            except Exception:
+                logger.exception("Failed to parse saved aggregated section for name=%s", name)
+            continue
+
+        lane_section = sections.get("laneballs") or {}
+        body_section = sections.get("fourdbody") or {}
+        if not lane_section and not body_section:
+            continue
+        try:
+            runs[name] = AggRunOutput(
+                ball_points=[
+                    BallPoint(x=float(point.get("x", 0.0)), y=float(point.get("y", 0.0)))
+                    for point in lane_section.get("ball_points", [])
+                ],
+                kinematics_table=[
+                    KinematicsRow(
+                        quarter=int(row.get("quarter", 0)),
+                        start_m=float(row.get("start_m", 0.0)),
+                        end_m=float(row.get("end_m", 0.0)),
+                        mean_speed_mps=float(row.get("mean_speed_mps", 0.0)),
+                        mean_acceleration_mps2=float(row.get("mean_acceleration_mps2", 0.0)),
+                        sample_count=int(row.get("sample_count", 0)),
+                    )
+                    for row in lane_section.get("kinematics_table", [])
+                ],
+                skeleton_points=[
+                    [
+                        SkeletonPoint(
+                            joint_id=int(joint.get("joint_id", 0)),
+                            x=float(joint.get("x", 0.0)),
+                            y=float(joint.get("y", 0.0)),
+                            z=float(joint.get("z", 0.0)),
+                        )
+                        for joint in frame
+                    ]
+                    for frame in body_section.get("skeleton_points", [])
+                ],
+            )
+        except Exception:
+            logger.exception("Failed to synthesize aggregate query for name=%s", name)
+
+    return AggQueryOutput(shots=shots, runs=runs)

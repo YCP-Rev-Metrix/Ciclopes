@@ -12,7 +12,8 @@ from core.VideoUtil.SpacesApiClient import query_json_via_api, query_video_via_a
 
 from core.LaneBalls.Kinematics import compute_kinematics_per_quarter
 from core.LaneBalls.models import BallPos
-from core.MockDB.mock_db_reader import load_shots
+from core.MockDB.mock_db_reader import load_named_runs, load_shots
+from core.MockDB.mock_db_writer import default_run_name, save_named_run_section
 from src.modules.LaneBalls.models import (
     BallPoint,
     KinematicsRow,
@@ -54,6 +55,12 @@ def _get_settings(request: Request):
     if settings is None:
         raise HTTPException(status_code=503, detail="Application settings are not initialized")
     return settings
+
+
+def _model_to_dict(model):
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
 
 
 @router.post("/run", response_model=LaneBallRunOutput)
@@ -194,7 +201,7 @@ async def _run_lane_ball_pipeline_inner(request: Request, payload: LaneBallRunIn
         postprocess_ms=health_raw.get("postprocess_ms", 0.0),
     )
 
-    return LaneBallRunOutput(
+    output = LaneBallRunOutput(
         fps=fps,
         ball_points=ball_points,
         kinematics_table=kinematics_table,
@@ -202,6 +209,18 @@ async def _run_lane_ball_pipeline_inner(request: Request, payload: LaneBallRunIn
         homography_frame=lane_ball_output.get("homography_frame"),
         health=health,
     )
+    run_name = payload.save_name or default_run_name(payload.video_key)
+    try:
+        save_named_run_section(
+            name=run_name,
+            section="laneballs",
+            response=_model_to_dict(output),
+            video_key=payload.video_key,
+            sd_key=payload.sd_key,
+        )
+    except Exception:
+        logger.exception("Failed to save laneballs run name=%s", run_name)
+    return output
 
 
 @router.post("/query", response_model=LaneBallQueryOutput)
@@ -243,4 +262,14 @@ async def query_lane_ball_shots(payload: LaneBallQueryInput):
             health=LaneBallHealthInfo(),
         )
 
-    return LaneBallQueryOutput(shots=shots)
+    runs: dict[str, LaneBallRunOutput] = {}
+    for name, rec in load_named_runs(payload.names).items():
+        section = rec.get("sections", {}).get("laneballs")
+        if not section:
+            continue
+        try:
+            runs[name] = LaneBallRunOutput(**section)
+        except Exception:
+            logger.exception("Failed to parse saved laneballs section for name=%s", name)
+
+    return LaneBallQueryOutput(shots=shots, runs=runs)

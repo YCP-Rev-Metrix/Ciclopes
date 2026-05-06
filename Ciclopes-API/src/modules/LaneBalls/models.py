@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 class LaneBallRunInput(BaseModel):
     video_key: str = Field(..., description="Object key for input video in bucket")
     sd_key: str = Field("key", description="Sensor data key in bucket; 'key' = test mode (use hardcoded start frame)")
+    save_name: str | None = Field(None, description="Optional local name for saving this run for later query")
 
 
 class BallPoint(BaseModel):
@@ -44,8 +45,10 @@ class LaneBallRunOutput(BaseModel):
 
 
 class LaneBallQueryInput(BaseModel):
-    shot_numbers: list[int] = Field(..., description="Shot numbers to retrieve from the mock DB")
+    shot_numbers: list[int] = Field(default_factory=list, description="Legacy shot numbers to retrieve from the mock DB")
+    names: list[str] = Field(default_factory=list, description="Saved run names to retrieve from the local mock DB")
 
 
 class LaneBallQueryOutput(BaseModel):
-    shots: dict[int, LaneBallRunOutput]
+    shots: dict[int, LaneBallRunOutput] = Field(default_factory=dict)
+    runs: dict[str, LaneBallRunOutput] = Field(default_factory=dict)
