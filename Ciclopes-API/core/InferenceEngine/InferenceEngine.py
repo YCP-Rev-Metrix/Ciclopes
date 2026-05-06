@@ -108,8 +108,8 @@ class InferenceEngine:
         """
         Full lane-ball pipeline:
           1) YOLO seg on all frames (batched)
-          2) first trapezoid homography search from start_frame
-          3) ball contact-point projection to lane meters
+          2) lane homography search across the video
+          3) ball contact-point projection to lane meters from start_frame
           4) kinematics per quarter
         """
         if not frames_rgb:
@@ -275,7 +275,8 @@ class InferenceEngine:
             post = run_lane_ball_postprocessing(
                 segmentations_by_frame=segmentations_by_frame,
                 fps=fps,
-                start_frame=start_frame,
+                start_frame=0,
+                ball_start_frame=start_frame,
                 frames_bgr=frames_bgr,
             )
         except Exception:

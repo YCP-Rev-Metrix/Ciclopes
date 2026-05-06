@@ -116,6 +116,15 @@ class TrackedLane:
 
 
 @dataclass(frozen=True)
+class LaneGeometryObservation:
+    frame_index: int
+    polygon: np.ndarray
+    score: float
+    centroid_x: float
+    pins_box: np.ndarray | None
+
+
+@dataclass(frozen=True)
 class GeometryTuning:
     pins_y_tolerance_ratio: float = 0.30
     pins_lane_width_scale: float = 1.70
@@ -134,6 +143,9 @@ class GeometryTuning:
     right_top_geometry_pull: float = 0.12
     target_taper_ratio: float = 0.45
     bottom_width_target_weight: float = 0.68
+    multi_frame_centroid_px: float = 90.0
+    multi_frame_max_observations: int = 31
+    multi_frame_min_observations: int = 5
 
 
 class TemporalSmoother:
@@ -700,6 +712,143 @@ def point_on_ray_with_shared_lambda(
     return bottom + lam * (vanishing - bottom)
 
 
+def _median_or_none(values: Sequence[float]) -> float | None:
+    if not values:
+        return None
+    return float(np.median(np.asarray(values, dtype=np.float32)))
+
+
+def _aggregate_lane_quad_from_observations(
+    observations: Sequence[LaneGeometryObservation],
+    *,
+    tuning: GeometryTuning,
+) -> np.ndarray | None:
+    if len(observations) < tuning.multi_frame_min_observations:
+        return None
+
+    sorted_obs = sorted(
+        observations,
+        key=lambda obs: (obs.pins_box is not None, obs.score),
+        reverse=True,
+    )[: tuning.multi_frame_max_observations]
+
+    bottom_centers_x: list[float] = []
+    bottom_ys: list[float] = []
+    bottom_widths: list[float] = []
+    top_ys: list[float] = []
+    top_center_xs: list[float] = []
+    top_width_targets: list[float] = []
+    right_as: list[float] = []
+    right_bs: list[float] = []
+    left_as: list[float] = []
+    left_bs: list[float] = []
+
+    for obs in sorted_obs:
+        poly = obs.polygon.astype(np.float32)
+        tl, tr, br, bl = poly[0], poly[1], poly[2], poly[3]
+
+        bottom_centers_x.append(float((bl[0] + br[0]) * 0.5))
+        bottom_ys.append(float((bl[1] + br[1]) * 0.5))
+        bottom_widths.append(float(br[0] - bl[0]))
+
+        right_line = line_from_segment(tr, br)
+        left_line = line_from_segment(tl, bl)
+        if right_line is not None:
+            right_as.append(float(right_line[0]))
+            right_bs.append(float(right_line[1]))
+        if left_line is not None:
+            left_as.append(float(left_line[0]))
+            left_bs.append(float(left_line[1]))
+
+        if obs.pins_box is not None:
+            pins_cx = 0.5 * float(obs.pins_box[0] + obs.pins_box[2])
+            pins_half_w = 0.5 * float(obs.pins_box[2] - obs.pins_box[0])
+            top_ys.append(float(obs.pins_box[3]))
+            top_center_xs.append(pins_cx)
+            top_width_targets.append(2.0 * pins_half_w * tuning.pins_lane_width_scale)
+        else:
+            top_ys.append(float((tl[1] + tr[1]) * 0.5))
+            top_center_xs.append(float((tl[0] + tr[0]) * 0.5))
+            top_width_targets.append(float(max(tr[0] - tl[0], 1.0)))
+
+    bottom_center_x = _median_or_none(bottom_centers_x)
+    bottom_y = _median_or_none(bottom_ys)
+    current_bottom_width = _median_or_none(bottom_widths)
+    top_y = _median_or_none(top_ys)
+    top_center_x = _median_or_none(top_center_xs)
+    top_width_target = _median_or_none(top_width_targets)
+    right_a = _median_or_none(right_as)
+    right_b = _median_or_none(right_bs)
+    left_a = _median_or_none(left_as)
+    left_b = _median_or_none(left_bs)
+
+    if (
+        bottom_center_x is None
+        or bottom_y is None
+        or current_bottom_width is None
+        or top_y is None
+        or top_center_x is None
+        or top_width_target is None
+    ):
+        return None
+
+    geometric_bottom_width = top_width_target / max(tuning.target_taper_ratio, 1e-6)
+    bottom_width = (
+        (1.0 - tuning.bottom_width_target_weight) * current_bottom_width
+        + tuning.bottom_width_target_weight * geometric_bottom_width
+    )
+    bottom_width = min(bottom_width, current_bottom_width)
+    bottom_width = max(bottom_width, top_width_target + 1.0)
+
+    bl = np.array([bottom_center_x - 0.5 * bottom_width, bottom_y], dtype=np.float32)
+    br = np.array([bottom_center_x + 0.5 * bottom_width, bottom_y], dtype=np.float32)
+    centerline = line_from_segment(
+        np.array([bottom_center_x, bottom_y], dtype=np.float32),
+        np.array([top_center_x, top_y], dtype=np.float32),
+    )
+
+    right_line = (right_a, right_b) if right_a is not None and right_b is not None else None
+    left_line = (left_a, left_b) if left_a is not None and left_b is not None else None
+    vanishing = intersect_xy_lines(right_line, centerline)
+    if vanishing is None:
+        vanishing = intersect_xy_lines(left_line, centerline)
+    if vanishing is None or float(vanishing[1]) >= top_y:
+        return None
+
+    dy_right = float(vanishing[1] - br[1])
+    if abs(dy_right) < 1e-6:
+        return None
+    shared_lam = (top_y - br[1]) / dy_right
+    shared_lam = float(np.clip(shared_lam, 0.01, 0.99))
+
+    tr = point_on_ray_with_shared_lambda(br, vanishing, shared_lam)
+    tl = point_on_ray_with_shared_lambda(bl, vanishing, shared_lam)
+
+    current_top_width = float(max(tr[0] - tl[0], 1.0))
+    top_width = (
+        (1.0 - tuning.top_width_target_weight) * current_top_width
+        + tuning.top_width_target_weight * top_width_target
+    )
+    top_width = min(top_width, bottom_width * tuning.max_top_width_ratio)
+    tl[0] = float(top_center_x - 0.5 * top_width)
+    tr[0] = float(top_center_x + 0.5 * top_width)
+    tl[1] = float(top_y)
+    tr[1] = float(top_y)
+
+    quad = np.array([tl, tr, br, bl], dtype=np.float32)
+    return quad.astype(np.int32)
+
+
+def _aggregate_pins_box_from_observations(
+    observations: Sequence[LaneGeometryObservation],
+) -> np.ndarray | None:
+    pins = [obs.pins_box for obs in observations if obs.pins_box is not None]
+    if not pins:
+        return None
+    arr = np.asarray(pins, dtype=np.float32)
+    return np.median(arr, axis=0).astype(np.int32)
+
+
 def _rebuild_quad_with_geometry(
     quad: np.ndarray,
     *,
@@ -954,6 +1103,22 @@ def find_nearest_pins_box_for_polygon(
             best_box = box
 
     return best_box
+
+
+def build_lane_geometry_observation(
+    frame_index: int,
+    polygon: np.ndarray,
+    score: float,
+    pins_boxes: Sequence[np.ndarray],
+) -> LaneGeometryObservation:
+    pins_box = find_nearest_pins_box_for_polygon(polygon, pins_boxes)
+    return LaneGeometryObservation(
+        frame_index=frame_index,
+        polygon=polygon.copy(),
+        score=float(score),
+        centroid_x=float(np.mean(polygon[:, 0])),
+        pins_box=(pins_box.copy() if pins_box is not None else None),
+    )
 
 
 def build_lane_trapezoid(
@@ -1271,6 +1436,7 @@ def run_lane_ball_postprocessing(
     smoother = TemporalSmoother()
     coverage_values: List[float] = []
     frame_candidate_count: Dict[int, int] = {}
+    lane_observations: List[LaneGeometryObservation] = []
 
     scanned = 0
     frames_with_lane = 0
@@ -1307,6 +1473,14 @@ def run_lane_ball_postprocessing(
                 continue
             candidates.append(trap)
             lane_mask_areas.append(float(np.count_nonzero(lane_mask)))
+            lane_observations.append(
+                build_lane_geometry_observation(
+                    frame_index,
+                    trap.polygon,
+                    trap.score,
+                    pins_boxes,
+                )
+            )
 
         frame_candidate_count[frame_index] = len(candidates)
         if candidates:
@@ -1325,21 +1499,40 @@ def run_lane_ball_postprocessing(
             coverage=float(np.mean(coverage_values)) if coverage_values else 0.0,
         )
 
-    src_corners = active_lane.best_quad.astype(np.float32)
+    active_centroid_x = float(np.mean(active_lane.best_quad[:, 0]))
+    matched_observations = [
+        obs
+        for obs in lane_observations
+        if abs(obs.centroid_x - active_centroid_x) <= tuning.multi_frame_centroid_px
+    ]
+
+    aggregated_quad = _aggregate_lane_quad_from_observations(
+        matched_observations,
+        tuning=tuning,
+    )
+
+    if aggregated_quad is not None:
+        src_corners = aggregated_quad.astype(np.float32)
+    else:
+        src_corners = active_lane.best_quad.astype(np.float32)
+
     src_corners = _correct_trapezoid_top_corners(src_corners)
-    best_frame_seg = segmentations_by_frame.get(active_lane.best_frame_idx)
-    if best_frame_seg is not None:
-        best_pins_boxes = _masks_to_boxes(best_frame_seg.pins_masks)
-        nearest_pins_box = find_nearest_pins_box_for_polygon(src_corners, best_pins_boxes)
-        guided_corners = _apply_post_pins_top_edge_guidance(
-            src_corners,
-            nearest_pins_box,
-            tuning=tuning,
-        )
-        guided_width_top = abs(float(guided_corners[1, 0]) - float(guided_corners[0, 0]))
-        guided_width_bottom = abs(float(guided_corners[2, 0]) - float(guided_corners[3, 0]))
-        if guided_width_top < guided_width_bottom:
-            src_corners = guided_corners
+    aggregated_pins_box = _aggregate_pins_box_from_observations(matched_observations)
+    if aggregated_pins_box is None:
+        best_frame_seg = segmentations_by_frame.get(active_lane.best_frame_idx)
+        if best_frame_seg is not None:
+            best_pins_boxes = _masks_to_boxes(best_frame_seg.pins_masks)
+            aggregated_pins_box = find_nearest_pins_box_for_polygon(src_corners, best_pins_boxes)
+
+    guided_corners = _apply_post_pins_top_edge_guidance(
+        src_corners,
+        aggregated_pins_box,
+        tuning=tuning,
+    )
+    guided_width_top = abs(float(guided_corners[1, 0]) - float(guided_corners[0, 0]))
+    guided_width_bottom = abs(float(guided_corners[2, 0]) - float(guided_corners[3, 0]))
+    if guided_width_top < guided_width_bottom:
+        src_corners = guided_corners
     dst = _lane_dst_corners_m()
     homography = cv2.getPerspectiveTransform(src_corners, dst)
 
@@ -1349,7 +1542,7 @@ def run_lane_ball_postprocessing(
         src_corners=src_corners,
         dst_corners=dst,
         is_trapezoid=True,
-        selected_lane_contours=int(frame_candidate_count.get(active_lane.best_frame_idx, 1)),
+        selected_lane_contours=int(max(len(matched_observations), frame_candidate_count.get(active_lane.best_frame_idx, 1))),
     )
 
     positions: List[BallPos] = []

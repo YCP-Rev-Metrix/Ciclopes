@@ -7,6 +7,7 @@ import numpy as np
 from scipy.interpolate import UnivariateSpline
 
 from core.LaneBalls.models import BallPos
+from core.LaneBalls.Postprocessing import LANE_LENGTH_M
 
 logger = logging.getLogger("ciclopes.interpolation")
 
@@ -17,9 +18,72 @@ logger = logging.getLogger("ciclopes.interpolation")
 _SMOOTH_SIGMA_M = 0.04  # assumed per-detection noise in metres
 
 
+def _isotonic_non_decreasing(values: np.ndarray) -> np.ndarray:
+    if values.size <= 1:
+        return values.astype(np.float64, copy=True)
+
+    block_starts: List[int] = []
+    block_ends: List[int] = []
+    block_weights: List[float] = []
+    block_means: List[float] = []
+
+    for idx, value in enumerate(values.astype(np.float64)):
+        block_starts.append(idx)
+        block_ends.append(idx + 1)
+        block_weights.append(1.0)
+        block_means.append(float(value))
+
+        while len(block_means) >= 2 and block_means[-2] > block_means[-1]:
+            w_prev = block_weights[-2]
+            w_last = block_weights[-1]
+            merged_weight = w_prev + w_last
+            merged_mean = (
+                block_means[-2] * w_prev + block_means[-1] * w_last
+            ) / merged_weight
+
+            block_ends[-2] = block_ends[-1]
+            block_weights[-2] = merged_weight
+            block_means[-2] = merged_mean
+
+            block_starts.pop()
+            block_ends.pop()
+            block_weights.pop()
+            block_means.pop()
+
+    out = np.empty(values.shape, dtype=np.float64)
+    for start, end, mean in zip(block_starts, block_ends, block_means):
+        out[start:end] = mean
+    return out
+
+
+def _spread_flat_forward_segments(values: np.ndarray) -> np.ndarray:
+    if values.size <= 2:
+        return values.astype(np.float64, copy=True)
+
+    out = values.astype(np.float64, copy=True)
+    n = int(out.size)
+    idx = 0
+    while idx < n:
+        end = idx + 1
+        while end < n and abs(float(out[end] - out[idx])) < 1e-9:
+            end += 1
+
+        run_len = end - idx
+        if run_len > 1 and idx > 0 and end < n:
+            prev_y = float(out[idx - 1])
+            next_y = float(out[end])
+            if next_y > prev_y:
+                out[idx:end] = np.linspace(prev_y, next_y, run_len + 2)[1:-1]
+
+        idx = end
+
+    return np.maximum.accumulate(out)
+
+
 def interpolate_ball_positions(
     positions: List[BallPos],
     fps: float,
+    lane_length_m: float = LANE_LENGTH_M,
 ) -> List[BallPos]:
     """
     Smooth and densify sparse ball detections using a smoothing spline.
@@ -78,6 +142,10 @@ def interpolate_ball_positions(
         # Too few points for a meaningful smooth — linear fallback
         smooth_x = np.interp(all_frames, frames, xs)
         smooth_y = np.interp(all_frames, frames, ys)
+
+    smooth_y = _isotonic_non_decreasing(np.asarray(smooth_y, dtype=np.float64))
+    smooth_y = _spread_flat_forward_segments(smooth_y)
+    smooth_y = np.clip(smooth_y, 0.0, lane_length_m)
 
     safe_fps = max(fps, 1e-6)
     dense: List[BallPos] = []

@@ -88,7 +88,7 @@ def main():
     password = "string"
 
     # Input video to upload (place a small test file next to the repo root)
-    input_video = Path("shot3.mp4")
+    input_video = Path("hake_test_edited.mp4")
     output_video = Path("downloaded_test.mp4")
 
     # 1) Authorize
