@@ -12,13 +12,61 @@ import torch
 
 from core.InferenceEngine.LaneBallInference import LaneBallInference
 from core.InferenceEngine.Sam3DBodyInference import Sam3DBodyInference
-from core.LaneBalls.Extrapolation import append_departure_point, trim_raw_detections
+from core.LaneBalls.Extrapolation import append_departure_point, diagnose_trim_raw_detections
 from core.LaneBalls.Interprolation import interpolate_ball_positions
 from core.LaneBalls.Kinematics import compute_kinematics_per_quarter
 from core.LaneBalls.Postprocessing import run_lane_ball_postprocessing
 from core.LaneBalls.Preprocessing import extract_frame_segmentation
 
 logger = logging.getLogger("ciclopes.inference_engine")
+
+
+def _log_lane_ball_position_diagnostics(
+    raw_positions: list,
+    clean_positions: list,
+    smooth_positions: list,
+    final_positions: list,
+    trim_diag: Any,
+) -> None:
+    logger.info(
+        "LaneBall positions: raw=%d trimmed=%d smoothed=%d final=%d",
+        len(raw_positions),
+        len(clean_positions),
+        len(smooth_positions),
+        len(final_positions),
+    )
+    if trim_diag.cut_reason is not None:
+        logger.info(
+            "LaneBall trim: reason=%s cut_frame=%s last_kept=%s dy=%s median_dy=%s cut_x=%s cut_y=%s",
+            trim_diag.cut_reason,
+            trim_diag.cut_frame_index,
+            trim_diag.last_kept_frame_index,
+            f"{trim_diag.current_dy:.3f}" if trim_diag.current_dy is not None else "nan",
+            f"{trim_diag.median_dy:.3f}" if trim_diag.median_dy is not None else "nan",
+            f"{trim_diag.cut_x_m:.3f}" if trim_diag.cut_x_m is not None else "nan",
+            f"{trim_diag.cut_y_m:.3f}" if trim_diag.cut_y_m is not None else "nan",
+        )
+    else:
+        logger.info("LaneBall trim: no cut triggered")
+
+    if not raw_positions:
+        return
+
+    sorted_raw = sorted(raw_positions, key=lambda p: p.frame_index)
+    xs = np.asarray([p.x_m for p in sorted_raw], dtype=np.float64)
+    ys = np.asarray([p.y_m for p in sorted_raw], dtype=np.float64)
+    frames = np.asarray([p.frame_index for p in sorted_raw], dtype=np.int32)
+    largest_gap = int(np.max(np.diff(frames))) if frames.size > 1 else 0
+    logger.info(
+        "LaneBall raw span: frames=%d-%d largest_gap=%d x_range=%.3f..%.3f y_range=%.3f..%.3f",
+        sorted_raw[0].frame_index,
+        sorted_raw[-1].frame_index,
+        largest_gap,
+        float(np.min(xs)),
+        float(np.max(xs)),
+        float(np.min(ys)),
+        float(np.max(ys)),
+    )
 
 
 class InferenceEngine:
@@ -293,9 +341,17 @@ class InferenceEngine:
 
         # ── Trim → Interpolate → Departure → Kinematics ─────────────────
         raw_positions = post.ball_positions.ball_positions
-        clean_positions = trim_raw_detections(raw_positions)
+        trim_diag = diagnose_trim_raw_detections(raw_positions)
+        clean_positions = trim_diag.kept_positions
         smooth_positions = interpolate_ball_positions(clean_positions, fps)
         final_positions = append_departure_point(smooth_positions, fps)
+        _log_lane_ball_position_diagnostics(
+            raw_positions,
+            clean_positions,
+            smooth_positions,
+            final_positions,
+            trim_diag,
+        )
         kin = compute_kinematics_per_quarter(final_positions)
 
         return {

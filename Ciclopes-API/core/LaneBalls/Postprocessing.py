@@ -598,6 +598,18 @@ def _x_at_y(line: tuple[float, float, float] | tuple[float, float], y: float) ->
     return float(line[0] * y + line[1])
 
 
+def _line_x_of_y_from_points(
+    p0: np.ndarray,
+    p1: np.ndarray,
+) -> Optional[tuple[float, float]]:
+    dy = float(p1[1] - p0[1])
+    if abs(dy) < 1e-6:
+        return None
+    slope = float(p1[0] - p0[0]) / dy
+    intercept = float(p0[0]) - slope * float(p0[1])
+    return slope, intercept
+
+
 def _mask_boundary_xs_near_y(
     mask: np.ndarray,
     y: float,
@@ -610,7 +622,7 @@ def _mask_boundary_xs_near_y(
     xs = np.where(mask[y0:y1, :] > 0)[1]
     if xs.size < 8:
         return None
-    return float(np.percentile(xs, 2.0)), float(np.percentile(xs, 98.0))
+    return float(np.percentile(xs, 0.5)), float(np.percentile(xs, 99.5))
 
 
 def _scanline_boundary_samples(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -637,8 +649,8 @@ def _scanline_boundary_samples(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray
         if xs.size < 12:
             continue
 
-        left_x = float(np.percentile(xs, 3.0))
-        right_x = float(np.percentile(xs, 97.0))
+        left_x = float(np.percentile(xs, 1.0))
+        right_x = float(np.percentile(xs, 99.0))
         width = right_x - left_x
         if width < 10:
             continue
@@ -760,8 +772,8 @@ def _fit_quad_from_dense_mask(
         return None
 
     all_y = np.concatenate([left_pts[:, 1], right_pts[:, 1]])
-    top_y = float(np.percentile(all_y, 3.0))
-    bottom_y = float(np.percentile(all_y, 97.0))
+    top_y = float(np.percentile(all_y, 2.0))
+    bottom_y = float(np.percentile(all_y, 99.5))
 
     if bottom_y - top_y < lane_mask.shape[0] * 0.045:
         reject("dense_short_y_span")
@@ -965,6 +977,26 @@ def _aggregate_lane_quad_from_observations(
     quad[1, 1] = top_y
     quad[2, 1] = bottom_y
     quad[3, 1] = bottom_y
+
+    top_left_xs: List[float] = []
+    top_right_xs: List[float] = []
+    bottom_left_xs: List[float] = []
+    bottom_right_xs: List[float] = []
+    for q in quads:
+        left_line = _line_x_of_y_from_points(q[0], q[3])
+        right_line = _line_x_of_y_from_points(q[1], q[2])
+        if left_line is None or right_line is None:
+            continue
+        top_left_xs.append(_x_at_y(left_line, top_y))
+        top_right_xs.append(_x_at_y(right_line, top_y))
+        bottom_left_xs.append(_x_at_y(left_line, bottom_y))
+        bottom_right_xs.append(_x_at_y(right_line, bottom_y))
+
+    if len(bottom_left_xs) >= 3:
+        quad[0, 0] = float(np.median(top_left_xs))
+        quad[1, 0] = float(np.median(top_right_xs))
+        quad[3, 0] = float(np.percentile(bottom_left_xs, 10.0))
+        quad[2, 0] = float(np.percentile(bottom_right_xs, 90.0))
 
     quad[:, 0] = np.clip(quad[:, 0], 0, img_shape_hw[1] - 1)
     quad[:, 1] = np.clip(quad[:, 1], 0, img_shape_hw[0] - 1)
@@ -1294,6 +1326,82 @@ def _ball_path_score(
     )
 
 
+def _track_average_area(track: TrackedLane) -> float:
+    return float(track.total_mask_area / max(track.seen_count, 1))
+
+
+def _quad_bottom_width_px(quad: np.ndarray) -> float:
+    q = quad.astype(np.float64)
+    return abs(float(q[2, 0] - q[3, 0]))
+
+
+def _quad_top_center_x(quad: np.ndarray) -> float:
+    q = quad.astype(np.float64)
+    return 0.5 * float(q[0, 0] + q[1, 0])
+
+
+def _quad_centroid_x(quad: np.ndarray) -> float:
+    return float(np.mean(quad.astype(np.float64)[:, 0]))
+
+
+def _observation_matches_track(
+    obs: LaneGeometryObservation,
+    track: TrackedLane,
+) -> bool:
+    obs_top_cx = _quad_top_center_x(obs.polygon)
+    track_top_cx = _quad_top_center_x(track.best_quad)
+    if abs(obs_top_cx - track_top_cx) <= 55.0:
+        return True
+
+    obs_q = obs.polygon.astype(np.float64)
+    track_q = track.best_quad.astype(np.float64)
+    same_right_edge = (
+        abs(float(obs_q[1, 0] - track_q[1, 0])) <= 65.0
+        and abs(float(obs_q[2, 0] - track_q[2, 0])) <= 45.0
+    )
+    if same_right_edge:
+        return True
+
+    centroid_tol = max(90.0, track.best_support_score * 140.0)
+    return abs(obs.centroid_x - _quad_centroid_x(track.best_quad)) <= centroid_tol
+
+
+def _lane_track_selection_metrics(
+    selection: LaneTrackSelection,
+    *,
+    max_avg_area: float,
+    max_bottom_width: float,
+) -> tuple[float, float, float, float]:
+    avg_area = _track_average_area(selection.track)
+    bottom_width = _quad_bottom_width_px(selection.src_corners)
+
+    area_score = (
+        min(avg_area / max(0.60 * max_avg_area, 1.0), 1.0)
+        if max_avg_area > 0.0
+        else 0.0
+    )
+    width_score = (
+        min(bottom_width / max(0.70 * max_bottom_width, 1.0), 1.0)
+        if max_bottom_width > 0.0
+        else 0.0
+    )
+    footprint_score = min(area_score, width_score)
+    ball_gate = 1.0 if footprint_score >= 0.65 else 0.35 * footprint_score
+    gated_ball_score = selection.ball_score * ball_gate
+
+    score = float(
+        np.clip(
+            0.50 * selection.lane_quality
+            + 0.20 * gated_ball_score
+            + 0.18 * area_score
+            + 0.12 * width_score,
+            0.0,
+            1.0,
+        )
+    )
+    return score, area_score, width_score, gated_ball_score
+
+
 def _correct_trapezoid_top_corners(
     quad: np.ndarray,
 ) -> np.ndarray:
@@ -1539,11 +1647,10 @@ def run_lane_ball_postprocessing(
     track_selections: List[LaneTrackSelection] = []
 
     for track in smoother.tracks:
-        active_centroid_x = float(np.mean(track.best_quad[:, 0]))
         matched_observations = [
             obs
             for obs in lane_observations
-            if abs(obs.centroid_x - active_centroid_x) <= max(90.0, track.best_support_score * 140.0)
+            if _observation_matches_track(obs, track)
         ]
 
         src_corners = track.best_quad.astype(np.float32)
@@ -1574,6 +1681,16 @@ def run_lane_ball_postprocessing(
             )
         )
 
+    max_avg_area = max((_track_average_area(sel.track) for sel in track_selections), default=0.0)
+    max_bottom_width = max((_quad_bottom_width_px(sel.src_corners) for sel in track_selections), default=0.0)
+    selection_metrics = {
+        id(sel): _lane_track_selection_metrics(
+            sel,
+            max_avg_area=max_avg_area,
+            max_bottom_width=max_bottom_width,
+        )
+        for sel in track_selections
+    }
     max_ball_score = max((sel.ball_score for sel in track_selections), default=0.0)
     if max_ball_score >= 0.08:
         selected_track = max(
@@ -1592,6 +1709,15 @@ def run_lane_ball_postprocessing(
         "Lane track selection: %s",
         " | ".join(
             f"lane_q={sel.lane_quality:.3f} ball_q={sel.ball_score:.3f} "
+            f"gated_ball_q={selection_metrics[id(sel)][3]:.3f} "
+            f"sel_q={selection_metrics[id(sel)][0]:.3f} "
+            f"area_q={selection_metrics[id(sel)][1]:.3f} "
+            f"width_q={selection_metrics[id(sel)][2]:.3f} "
+            f"top_cx={_quad_top_center_x(sel.src_corners):.0f}px "
+            f"bot_l={sel.src_corners[3, 0]:.0f}px "
+            f"bot_r={sel.src_corners[2, 0]:.0f}px "
+            f"bottom_w={_quad_bottom_width_px(sel.src_corners):.0f}px "
+            f"avg_area={_track_average_area(sel.track):.0f}px "
             f"seen={sel.track.seen_count} votes={sel.track.ball_votes} "
             f"best_frame={sel.track.best_frame_idx}"
             for sel in sorted(

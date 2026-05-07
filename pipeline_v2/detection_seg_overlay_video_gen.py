@@ -19,6 +19,9 @@ LANE_LENGTH_M = 18.288
 LANE_WIDTH_M = 1.0541
 DEFAULT_MIN_TRAPEZOID_SCORE = 0.20
 DEFAULT_BALL_START_FRAME = 60
+API_DEFAULT_BALL_START_FRAME = 40
+API_DEFAULT_MAX_VIDEO_FRAMES = 600
+API_DEFAULT_MAX_VIDEO_DIMENSION = 1024
 
 logger = logging.getLogger("pipeline_v2.lane_ball_overlay")
 YOLO_CLASS_NAME_BY_ID: Dict[int, str] = {0: "ball", 1: "lane", 2: "pins"}
@@ -404,37 +407,77 @@ def _transcode_to_mp4(video_path: str) -> str:
     return tmp.name
 
 
-def _read_frames(video_path: str) -> SplitVideo:
+def _resize_if_needed(frame: np.ndarray, max_dim: int | None) -> np.ndarray:
+    if max_dim is None or max_dim <= 0:
+        return frame
+    h, w = frame.shape[:2]
+    longest = max(h, w)
+    if longest <= max_dim:
+        return frame
+    scale = float(max_dim) / float(longest)
+    new_w = max(int(w * scale), 1)
+    new_h = max(int(h * scale), 1)
+    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def _read_frames(
+    video_path: str,
+    *,
+    max_frames: int | None = None,
+    max_dimension: int | None = None,
+) -> SplitVideo:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise FileNotFoundError(f"Could not open video at path: {video_path}")
 
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    split_video = SplitVideo(fps=fps, width=width, height=height)
+    source_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    source_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frame_cap = max_frames if max_frames is not None and max_frames > 0 else None
+    step = max(1, total_frames // frame_cap) if frame_cap and total_frames > frame_cap else 1
+    effective_fps = fps / step if step > 1 else fps
+    split_video = SplitVideo(fps=effective_fps, width=source_width, height=source_height)
 
     frame_index = 0
+    kept = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        timestamp_s = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
-        split_video.add_frame(
-            VideoFrame(frame_index=frame_index, timestamp=timestamp_s, image=frame)
-        )
+
+        if frame_index % step == 0:
+            frame = _resize_if_needed(frame, max_dimension)
+            if kept == 0:
+                split_video.height, split_video.width = frame.shape[:2]
+            timestamp_s = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
+            split_video.add_frame(
+                VideoFrame(frame_index=kept, timestamp=timestamp_s, image=frame)
+            )
+            kept += 1
+            if frame_cap and kept >= frame_cap:
+                break
         frame_index += 1
 
     cap.release()
     return split_video
 
 
-def split_video_into_frames(video_path: str) -> SplitVideo:
+def split_video_into_frames(
+    video_path: str,
+    *,
+    max_frames: int | None = None,
+    max_dimension: int | None = None,
+) -> SplitVideo:
     """
     Read video frames. If OpenCV can't decode the pixel format (e.g. YUV411P
     interlaced AVI), falls back to ffmpeg transcoding to a temp mp4 first.
     """
-    split_video = _read_frames(video_path)
+    split_video = _read_frames(
+        video_path,
+        max_frames=max_frames,
+        max_dimension=max_dimension,
+    )
 
     # Detect all-black frames from failed color conversion.
     if split_video.frames:
@@ -447,7 +490,11 @@ def split_video_into_frames(video_path: str) -> SplitVideo:
             print("Detected all-black frames (likely pixel format issue), transcoding...")
             tmp_path = _transcode_to_mp4(video_path)
             try:
-                split_video = _read_frames(tmp_path)
+                split_video = _read_frames(
+                    tmp_path,
+                    max_frames=max_frames,
+                    max_dimension=max_dimension,
+                )
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
 
@@ -945,6 +992,18 @@ def _x_at_y(line: tuple[float, float, float] | tuple[float, float], y: float) ->
     return float(line[0] * y + line[1])
 
 
+def _line_x_of_y_from_points(
+    p0: np.ndarray,
+    p1: np.ndarray,
+) -> tuple[float, float] | None:
+    dy = float(p1[1] - p0[1])
+    if abs(dy) < 1e-6:
+        return None
+    slope = float(p1[0] - p0[0]) / dy
+    intercept = float(p0[0]) - slope * float(p0[1])
+    return slope, intercept
+
+
 def _mask_boundary_xs_near_y(
     mask: np.ndarray,
     y: float,
@@ -958,7 +1017,7 @@ def _mask_boundary_xs_near_y(
     xs = np.where(mask[y0:y1, :] > 0)[1]
     if xs.size < 8:
         return None
-    return float(np.percentile(xs, 2.0)), float(np.percentile(xs, 98.0))
+    return float(np.percentile(xs, 0.5)), float(np.percentile(xs, 99.5))
 
 
 def _scanline_boundary_samples(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -990,8 +1049,8 @@ def _scanline_boundary_samples(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray
         if xs.size < 12:
             continue
 
-        left_x = float(np.percentile(xs, 3.0))
-        right_x = float(np.percentile(xs, 97.0))
+        left_x = float(np.percentile(xs, 1.0))
+        right_x = float(np.percentile(xs, 99.0))
         width = right_x - left_x
         if width < 10:
             continue
@@ -1116,8 +1175,8 @@ def _fit_quad_from_dense_mask(
         return None
 
     all_y = np.concatenate([left_pts[:, 1], right_pts[:, 1]])
-    top_y = float(np.percentile(all_y, 3.0))
-    bottom_y = float(np.percentile(all_y, 97.0))
+    top_y = float(np.percentile(all_y, 2.0))
+    bottom_y = float(np.percentile(all_y, 99.5))
 
     if bottom_y - top_y < lane_mask.shape[0] * 0.045:
         reject("dense_short_y_span")
@@ -1339,14 +1398,35 @@ def _aggregate_lane_quad_from_observations(
     quad = np.median(quads, axis=0).astype(np.float32)
 
     # Keep the top and bottom edges level enough for a stable homography, but
-    # use the segmented corner locations for x. This avoids pin/vanishing pulls
-    # that visually detach the top edge from an accurate mask.
+    # trust the outer segmentation envelope at the bottom. Bowler occlusion
+    # often creates subset masks after release; using a median bottom corner
+    # lets those subsets shrink the lane into the ball path.
     top_y = float(np.median(0.5 * (quads[:, 0, 1] + quads[:, 1, 1])))
     bottom_y = float(np.median(0.5 * (quads[:, 3, 1] + quads[:, 2, 1])))
     quad[0, 1] = top_y
     quad[1, 1] = top_y
     quad[2, 1] = bottom_y
     quad[3, 1] = bottom_y
+
+    top_left_xs: List[float] = []
+    top_right_xs: List[float] = []
+    bottom_left_xs: List[float] = []
+    bottom_right_xs: List[float] = []
+    for q in quads:
+        left_line = _line_x_of_y_from_points(q[0], q[3])
+        right_line = _line_x_of_y_from_points(q[1], q[2])
+        if left_line is None or right_line is None:
+            continue
+        top_left_xs.append(_x_at_y(left_line, top_y))
+        top_right_xs.append(_x_at_y(right_line, top_y))
+        bottom_left_xs.append(_x_at_y(left_line, bottom_y))
+        bottom_right_xs.append(_x_at_y(right_line, bottom_y))
+
+    if len(bottom_left_xs) >= 3:
+        quad[0, 0] = float(np.median(top_left_xs))
+        quad[1, 0] = float(np.median(top_right_xs))
+        quad[3, 0] = float(np.percentile(bottom_left_xs, 10.0))
+        quad[2, 0] = float(np.percentile(bottom_right_xs, 90.0))
 
     quad[:, 0] = np.clip(quad[:, 0], 0, img_shape_hw[1] - 1)
     quad[:, 1] = np.clip(quad[:, 1], 0, img_shape_hw[0] - 1)
@@ -1535,6 +1615,92 @@ def _ball_path_score(
             1.0,
         )
     )
+
+
+def _track_average_area(track: TrackedLane) -> float:
+    return float(track.total_mask_area / max(track.seen_count, 1))
+
+
+def _quad_bottom_width_px(quad: np.ndarray) -> float:
+    q = quad.astype(np.float64)
+    return abs(float(q[2, 0] - q[3, 0]))
+
+
+def _quad_top_center_x(quad: np.ndarray) -> float:
+    q = quad.astype(np.float64)
+    return 0.5 * float(q[0, 0] + q[1, 0])
+
+
+def _quad_centroid_x(quad: np.ndarray) -> float:
+    return float(np.mean(quad.astype(np.float64)[:, 0]))
+
+
+def _observation_matches_track(
+    obs: LaneGeometryObservation,
+    track: TrackedLane,
+) -> bool:
+    """
+    Associate occluded/subset lane detections with the same physical lane.
+    The far/top edge is the stable lane identity cue; bottom/centroid can shift
+    substantially when the bowler hides part of the near lane.
+    """
+    obs_top_cx = _quad_top_center_x(obs.polygon)
+    track_top_cx = _quad_top_center_x(track.best_quad)
+    if abs(obs_top_cx - track_top_cx) <= 55.0:
+        return True
+
+    obs_q = obs.polygon.astype(np.float64)
+    track_q = track.best_quad.astype(np.float64)
+    same_right_edge = (
+        abs(float(obs_q[1, 0] - track_q[1, 0])) <= 65.0
+        and abs(float(obs_q[2, 0] - track_q[2, 0])) <= 45.0
+    )
+    if same_right_edge:
+        return True
+
+    centroid_tol = max(90.0, track.best_support_score * 140.0)
+    return abs(obs.centroid_x - _quad_centroid_x(track.best_quad)) <= centroid_tol
+
+
+def _lane_track_selection_metrics(
+    selection: LaneTrackSelection,
+    *,
+    max_avg_area: float,
+    max_bottom_width: float,
+) -> tuple[float, float, float, float]:
+    """
+    Score a candidate homography lane without letting ball overlap rescue a
+    lane-like sliver. Ball support is useful for resolving adjacent lanes, but
+    only after the candidate has a credible footprint compared with peers.
+    """
+    avg_area = _track_average_area(selection.track)
+    bottom_width = _quad_bottom_width_px(selection.src_corners)
+
+    area_score = (
+        min(avg_area / max(0.60 * max_avg_area, 1.0), 1.0)
+        if max_avg_area > 0.0
+        else 0.0
+    )
+    width_score = (
+        min(bottom_width / max(0.70 * max_bottom_width, 1.0), 1.0)
+        if max_bottom_width > 0.0
+        else 0.0
+    )
+    footprint_score = min(area_score, width_score)
+    ball_gate = 1.0 if footprint_score >= 0.65 else 0.35 * footprint_score
+    gated_ball_score = selection.ball_score * ball_gate
+
+    score = float(
+        np.clip(
+            0.50 * selection.lane_quality
+            + 0.20 * gated_ball_score
+            + 0.18 * area_score
+            + 0.12 * width_score,
+            0.0,
+            1.0,
+        )
+    )
+    return score, area_score, width_score, gated_ball_score
 
 
 def _correct_trapezoid_top_corners(
@@ -2191,9 +2357,30 @@ def describe_processing_stages(
         lines.append("extrap: no appended departure point")
 
     if raw_positions:
-        lines.append(
-            f"raw span: frames {raw_positions[0].frame_index}-{raw_positions[-1].frame_index}"
+        sorted_raw = sorted(raw_positions, key=lambda p: p.frame_index)
+        xs = np.asarray([p.x_m for p in sorted_raw], dtype=np.float64)
+        ys = np.asarray([p.y_m for p in sorted_raw], dtype=np.float64)
+        frames = np.asarray([p.frame_index for p in sorted_raw], dtype=np.int32)
+        in_bounds = sum(
+            1 for p in sorted_raw
+            if _position_in_lane_bounds(p, LANE_WIDTH_M, LANE_LENGTH_M)
         )
+        largest_gap = int(np.max(np.diff(frames))) if frames.size > 1 else 0
+        lines.append(
+            f"raw span: frames {sorted_raw[0].frame_index}-{sorted_raw[-1].frame_index} "
+            f"largest_gap={largest_gap} in_bounds={in_bounds}/{len(sorted_raw)} "
+            f"x_range={float(np.min(xs)):.3f}..{float(np.max(xs)):.3f} "
+            f"y_range={float(np.min(ys)):.3f}..{float(np.max(ys)):.3f}"
+        )
+        head = ", ".join(
+            f"{p.frame_index}:{p.x_m:.2f},{p.y_m:.2f}" for p in sorted_raw[:4]
+        )
+        tail = ", ".join(
+            f"{p.frame_index}:{p.x_m:.2f},{p.y_m:.2f}" for p in sorted_raw[-4:]
+        )
+        lines.append(f"raw head: {head}")
+        if tail != head:
+            lines.append(f"raw tail: {tail}")
 
     return lines
 
@@ -2433,11 +2620,10 @@ def run_lane_ball_postprocessing(
     track_selections: List[LaneTrackSelection] = []
 
     for track in smoother.tracks:
-        active_centroid_x = float(np.mean(track.best_quad[:, 0]))
         matched_observations = [
             obs
             for obs in lane_observations
-            if abs(obs.centroid_x - active_centroid_x) <= max(90.0, track.best_support_score * 140.0)
+            if _observation_matches_track(obs, track)
         ]
 
         src_corners = track.best_quad.astype(np.float32)
@@ -2468,6 +2654,16 @@ def run_lane_ball_postprocessing(
             )
         )
 
+    max_avg_area = max((_track_average_area(sel.track) for sel in track_selections), default=0.0)
+    max_bottom_width = max((_quad_bottom_width_px(sel.src_corners) for sel in track_selections), default=0.0)
+    selection_metrics = {
+        id(sel): _lane_track_selection_metrics(
+            sel,
+            max_avg_area=max_avg_area,
+            max_bottom_width=max_bottom_width,
+        )
+        for sel in track_selections
+    }
     max_ball_score = max((sel.ball_score for sel in track_selections), default=0.0)
     if max_ball_score >= 0.08:
         selected_track = max(
@@ -2490,10 +2686,17 @@ def run_lane_ball_postprocessing(
             reverse=True,
         )[:8]
     ):
+        sel_score, area_q, width_q, gated_ball_q = selection_metrics[id(sel)]
         print(
             f"    rank{idx}: lane_q={sel.lane_quality:.3f} "
-            f"ball_q={sel.ball_score:.3f} seen={sel.track.seen_count} "
-            f"votes={sel.track.ball_votes} best_frame={sel.track.best_frame_idx}"
+            f"ball_q={sel.ball_score:.3f} gated_ball_q={gated_ball_q:.3f} "
+            f"sel_q={sel_score:.3f} area_q={area_q:.3f} width_q={width_q:.3f} "
+            f"top_cx={_quad_top_center_x(sel.src_corners):.0f}px "
+            f"bot_l={sel.src_corners[3, 0]:.0f}px bot_r={sel.src_corners[2, 0]:.0f}px "
+            f"bottom_w={_quad_bottom_width_px(sel.src_corners):.0f}px "
+            f"avg_area={_track_average_area(sel.track):.0f}px "
+            f"seen={sel.track.seen_count} votes={sel.track.ball_votes} "
+            f"best_frame={sel.track.best_frame_idx}"
         )
 
     logger.info(
@@ -2697,6 +2900,8 @@ def run_overlay_generation(
     enable_guided_trapezoid: bool,
     min_trapezoid_score: float,
     ball_start_frame: int,
+    max_video_frames: int | None,
+    max_video_dimension: int | None,
 ) -> None:
     _ = lane_class_id  # Kept for CLI compatibility; mirrored pipeline uses fixed API class ids.
 
@@ -2705,13 +2910,22 @@ def run_overlay_generation(
     names_raw = getattr(model, "names", None)
     class_names = normalize_model_names(names_raw)
 
-    split_video = split_video_into_frames(str(video_path))
+    split_video = split_video_into_frames(
+        str(video_path),
+        max_frames=max_video_frames,
+        max_dimension=max_video_dimension,
+    )
     if not split_video.frames:
         raise RuntimeError("No frames found in video.")
 
     fps = split_video.fps if split_video.fps > 0 else 30.0
     frames = split_video.frames
     total = len(frames)
+    print(
+        "Video frames: "
+        f"{total} @ {fps:.3f} fps, size={split_video.width}x{split_video.height}, "
+        f"ball_start_frame={ball_start_frame}"
+    )
 
     print("Pass 1: running inference and extracting API-aligned segmentations...")
     all_results: List[Any] = []
@@ -2918,8 +3132,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ball_start_frame",
         type=int,
-        default=DEFAULT_BALL_START_FRAME,
-        help="Ignore ball homography/contact processing before this frame",
+        default=None,
+        help=(
+            "Ignore ball homography/contact processing before this frame "
+            f"(default {DEFAULT_BALL_START_FRAME}, or {API_DEFAULT_BALL_START_FRAME} with --api_service_mode)"
+        ),
+    )
+    parser.add_argument(
+        "--api_service_mode",
+        action="store_true",
+        help=(
+            "Mirror API video envelope: max 600 frames, max dimension 1024, "
+            "and API default ball start frame when --ball_start_frame is omitted"
+        ),
+    )
+    parser.add_argument(
+        "--max_video_frames",
+        type=int,
+        default=None,
+        help="Subsample/cap decoded frames like the API service (use 600 to mirror API)",
+    )
+    parser.add_argument(
+        "--max_video_dimension",
+        type=int,
+        default=None,
+        help="Resize longest decoded frame edge like the API service (use 1024 to mirror API)",
     )
     return parser
 
@@ -2941,8 +3178,28 @@ def main() -> None:
         raise ValueError("--alpha must be in [0, 1]")
     if not (0.0 <= args.min_trapezoid_score <= 1.0):
         raise ValueError("--min_trapezoid_score must be in [0, 1]")
-    if args.ball_start_frame < 0:
+    ball_start_frame = (
+        int(args.ball_start_frame)
+        if args.ball_start_frame is not None
+        else (API_DEFAULT_BALL_START_FRAME if args.api_service_mode else DEFAULT_BALL_START_FRAME)
+    )
+    max_video_frames = (
+        int(args.max_video_frames)
+        if args.max_video_frames is not None
+        else (API_DEFAULT_MAX_VIDEO_FRAMES if args.api_service_mode else None)
+    )
+    max_video_dimension = (
+        int(args.max_video_dimension)
+        if args.max_video_dimension is not None
+        else (API_DEFAULT_MAX_VIDEO_DIMENSION if args.api_service_mode else None)
+    )
+
+    if ball_start_frame < 0:
         raise ValueError("--ball_start_frame must be >= 0")
+    if max_video_frames is not None and max_video_frames <= 0:
+        raise ValueError("--max_video_frames must be > 0")
+    if max_video_dimension is not None and max_video_dimension <= 0:
+        raise ValueError("--max_video_dimension must be > 0")
 
     run_overlay_generation(
         model_path=model_path,
@@ -2957,7 +3214,9 @@ def main() -> None:
         lane_class_id=int(args.lane_class_id),
         enable_guided_trapezoid=not bool(args.disable_guided_trapezoid),
         min_trapezoid_score=float(args.min_trapezoid_score),
-        ball_start_frame=int(args.ball_start_frame),
+        ball_start_frame=ball_start_frame,
+        max_video_frames=max_video_frames,
+        max_video_dimension=max_video_dimension,
     )
 
 
