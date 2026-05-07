@@ -15,7 +15,7 @@ logger = logging.getLogger("ciclopes.interpolation")
 # This is passed as scipy's `s` parameter (sum-of-squared-residuals budget).
 # For lane-metre coordinates the raw noise is typically ~0.02–0.08 m per
 # detection, so s ≈ N * σ² works well.  We derive it from the data below.
-_SMOOTH_SIGMA_M = 0.04  # assumed per-detection noise in metres
+_SMOOTH_SIGMA_M = 0.055  # assumed per-detection noise in metres
 
 
 def _isotonic_non_decreasing(values: np.ndarray) -> np.ndarray:
@@ -91,8 +91,11 @@ def _anchor_endpoint_values(
 
     out = smooth.astype(np.float64, copy=True)
     n = min(anchor_len, out.size)
-    front_weights = np.linspace(1.0, 0.0, n)
-    back_weights = np.linspace(0.0, 1.0, n)
+    # Soften the endpoint anchor: weight 1.0 at the very edge would re-inject
+    # the noisiest single sample. 0.5 keeps the endpoint biased toward the raw
+    # observation without fully overriding the smooth fit.
+    front_weights = np.linspace(0.5, 0.0, n)
+    back_weights = np.linspace(0.0, 0.5, n)
     out[:n] = front_weights * raw[:n] + (1.0 - front_weights) * out[:n]
     out[-n:] = back_weights * raw[-n:] + (1.0 - back_weights) * out[-n:]
     return out
@@ -168,6 +171,24 @@ def interpolate_ball_positions(
     smooth_y = _isotonic_non_decreasing(np.asarray(smooth_y, dtype=np.float64))
     smooth_y = _spread_flat_forward_segments(smooth_y)
     smooth_y = np.clip(smooth_y, 0.0, lane_length_m)
+
+    # Re-smooth x against cumulative y rather than frame index, so x stays
+    # well-behaved over any brief flat-y stretches the isotonic step produced.
+    if n >= 4 and smooth_y.size >= 6:
+        y_axis = np.asarray(smooth_y, dtype=np.float64)
+        x_axis = np.asarray(smooth_x, dtype=np.float64)
+        # Strictly-increasing axis required by UnivariateSpline.
+        eps = 1e-6
+        y_mono = np.maximum.accumulate(y_axis) + np.arange(y_axis.size) * eps
+        try:
+            s_x = n * (_SMOOTH_SIGMA_M ** 2)
+            spline_x_arc = UnivariateSpline(y_mono, x_axis, k=3, s=s_x)
+            smooth_x = spline_x_arc(y_mono)
+            smooth_x = _anchor_endpoint_values(
+                np.asarray(smooth_x, dtype=np.float64), x_axis
+            )
+        except Exception:
+            pass
 
     safe_fps = max(fps, 1e-6)
     dense: List[BallPos] = []

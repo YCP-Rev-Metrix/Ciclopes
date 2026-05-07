@@ -138,6 +138,74 @@ def _best_ball_motion_interval(
             break
         b -= 1
 
+    # ── Loft-resume prefix trim ──────────────────────────────────────────
+    # If there's a transient stall near the start (ball lofted, hit, briefly
+    # near-stationary, then resumed rolling), drop everything up to where
+    # consistent forward motion resumes. Clean trajectories have no such
+    # stall and are untouched.
+    if b - a >= 8:
+        kept_y = np.asarray([sorted_pos[i].y_m for i in range(a, b)], dtype=np.float64)
+        kept_dy = np.diff(kept_y)
+        if kept_dy.size >= 6:
+            mid_lo = int(len(kept_dy) * 0.20)
+            mid_hi = int(len(kept_dy) * 0.80)
+            mid = kept_dy[mid_lo:mid_hi] if mid_hi > mid_lo else kept_dy
+            mid_pos = mid[mid > 0]
+            if mid_pos.size >= 3:
+                median_dy = float(np.median(mid_pos))
+                stall_thr = 0.30 * median_dy
+                resume_thr = 0.45 * median_dy
+                # locate a stall (>=2 consecutive small/negative dy) in the
+                # first 40% of the kept window
+                scan_end = max(2, int(len(kept_dy) * 0.40))
+                stall_end = -1  # local index into kept_dy
+                streak = 0
+                for k in range(scan_end):
+                    if kept_dy[k] < stall_thr:
+                        streak += 1
+                        if streak >= 2:
+                            stall_end = k
+                    else:
+                        streak = 0
+                if stall_end >= 0:
+                    # find first index after stall where 3 consecutive forward
+                    # steps each clear resume_thr
+                    for k in range(stall_end + 1, len(kept_dy) - 2):
+                        if all(kept_dy[k + j] >= resume_thr for j in range(3)):
+                            a = a + k
+                            break
+
+    # ── Tail-cluster trim ────────────────────────────────────────────────
+    # Drop trailing samples whose dy collapses well below median (ball
+    # detector latched onto pins / debris) or whose dx spikes far beyond
+    # the run's lateral jitter.
+    if b - a >= 8:
+        kept_y = np.asarray([sorted_pos[i].y_m for i in range(a, b)], dtype=np.float64)
+        kept_x = np.asarray([sorted_pos[i].x_m for i in range(a, b)], dtype=np.float64)
+        kept_dy = np.diff(kept_y)
+        kept_dx = np.diff(kept_x)
+        mid_lo = int(len(kept_dy) * 0.20)
+        mid_hi = max(mid_lo + 1, int(len(kept_dy) * 0.80))
+        mid_dy_pos = kept_dy[mid_lo:mid_hi]
+        mid_dy_pos = mid_dy_pos[mid_dy_pos > 0]
+        mid_dx_std = float(np.std(kept_dx[mid_lo:mid_hi])) if mid_hi > mid_lo else 0.0
+        if mid_dy_pos.size >= 3:
+            median_dy = float(np.median(mid_dy_pos))
+            stall_thr = 0.25 * median_dy
+            dx_spike = max(2.5 * mid_dx_std, 0.08)
+            # walk back conservatively, capped at 6 trims and never below 6 left
+            trims = 0
+            while (b - a) > 6 and trims < 6:
+                last_dy = kept_dy[-1]
+                last_dx = abs(kept_dx[-1])
+                if last_dy < stall_thr or last_dx > dx_spike:
+                    b -= 1
+                    kept_dy = kept_dy[:-1]
+                    kept_dx = kept_dx[:-1]
+                    trims += 1
+                else:
+                    break
+
     return a, b
 
 
@@ -236,6 +304,17 @@ def append_departure_point(
     ys_t = np.array([p.y_m for p in tail], dtype=np.float64)
 
     vy = _linear_slope(frames_t[-min(_FIT_WINDOW, len(frames_t)):], ys_t[-min(_FIT_WINDOW, len(ys_t)):])
+
+    # If the tail has stalled (interp flattened by isotonic), fall back to
+    # the median per-frame dy across the whole run so we still extrapolate
+    # to the lane end at a plausible speed instead of bailing out.
+    full_ys = np.array([p.y_m for p in result], dtype=np.float64)
+    full_dy = np.diff(full_ys)
+    full_dy_pos = full_dy[full_dy > 1e-4]
+    median_vy = float(np.median(full_dy_pos)) if full_dy_pos.size >= 3 else 0.0
+    if vy < 0.30 * median_vy and median_vy > 1e-4:
+        vy = median_vy
+
     if abs(vy) < 1e-4:
         return result
 
