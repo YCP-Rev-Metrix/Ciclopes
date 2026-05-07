@@ -18,6 +18,7 @@ class AppSettings:
     lane_ball_start_frame: int = 40  # demo default — skip first N frames
     max_video_frames: int = 600     # OOM protection: cap extracted frames
     max_video_dimension: int = 1024 # OOM protection: downscale longest edge
+    lane_ball_max_video_dimension: int = 1280
     multi_gpu: bool = False
 
 
@@ -90,6 +91,12 @@ def load_app_settings() -> AppSettings:
     except ValueError:
         max_dim = 1024
 
+    lb_max_dim_raw = _env("LANE_BALL_MAX_VIDEO_DIMENSION", default="1280")
+    try:
+        lb_max_dim = max(int(lb_max_dim_raw), 128)
+    except ValueError:
+        lb_max_dim = 1280
+
     multi_gpu = _parse_bool(_env("MULTI_GPU", default="false"), default=False)
 
     return AppSettings(
@@ -105,5 +112,6 @@ def load_app_settings() -> AppSettings:
         sam3d_body_batch_size=sam3d_bs,
         max_video_frames=max_frames,
         max_video_dimension=max_dim,
+        lane_ball_max_video_dimension=lb_max_dim,
         multi_gpu=multi_gpu,
     )

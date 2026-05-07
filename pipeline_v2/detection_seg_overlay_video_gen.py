@@ -25,6 +25,7 @@ API_DEFAULT_MAX_VIDEO_DIMENSION = 1024
 
 logger = logging.getLogger("pipeline_v2.lane_ball_overlay")
 YOLO_CLASS_NAME_BY_ID: Dict[int, str] = {0: "ball", 1: "lane", 2: "pins"}
+MAX_LANE_MASKS_PER_FRAME = 4
 
 
 @dataclass
@@ -1911,6 +1912,13 @@ def extract_frame_segmentation(result: Any) -> FrameSegmentation:
         elif cls_id == 2:
             pins_masks.append(mask)
 
+    if len(lane_masks) > MAX_LANE_MASKS_PER_FRAME:
+        lane_masks = sorted(
+            lane_masks,
+            key=lambda m: int(np.count_nonzero(m)),
+            reverse=True,
+        )[:MAX_LANE_MASKS_PER_FRAME]
+
     return FrameSegmentation(
         ball_masks=ball_masks,
         lane_masks=lane_masks,
@@ -1927,6 +1935,8 @@ _X_MARGIN = 0.15
 _STEP_DROP_RATIO = 0.25
 _MIN_HISTORY = 3
 _FIT_WINDOW = 5
+_CURVE_FIT_WINDOW = 14
+_MAX_DEPARTURE_DX_M = 0.28
 _SMOOTH_SIGMA_M = 0.04
 _CONTACT_Y_TOL_M = 0.08
 _END_Y_TOL_M = 0.35
@@ -2009,6 +2019,24 @@ def _spread_flat_forward_segments(values: np.ndarray) -> np.ndarray:
         idx = end
 
     return np.maximum.accumulate(out)
+
+
+def _anchor_endpoint_values(
+    smooth: np.ndarray,
+    raw: np.ndarray,
+    *,
+    anchor_len: int = 5,
+) -> np.ndarray:
+    if smooth.size <= 2 or raw.size != smooth.size:
+        return smooth.astype(np.float64, copy=True)
+
+    out = smooth.astype(np.float64, copy=True)
+    n = min(anchor_len, out.size)
+    front_weights = np.linspace(1.0, 0.0, n)
+    back_weights = np.linspace(0.0, 1.0, n)
+    out[:n] = front_weights * raw[:n] + (1.0 - front_weights) * out[:n]
+    out[-n:] = back_weights * raw[-n:] + (1.0 - back_weights) * out[-n:]
+    return out
 
 
 def trim_raw_detections(
@@ -2226,6 +2254,10 @@ def interpolate_ball_positions(
         spline_y = UnivariateSpline(frames, ys, k=3, s=s)
         smooth_x = spline_x(all_frames)
         smooth_y = spline_y(all_frames)
+        raw_x = np.interp(all_frames, frames, xs)
+        raw_y = np.interp(all_frames, frames, ys)
+        smooth_x = _anchor_endpoint_values(np.asarray(smooth_x, dtype=np.float64), raw_x)
+        smooth_y = _anchor_endpoint_values(np.asarray(smooth_y, dtype=np.float64), raw_y)
     else:
         smooth_x = np.interp(all_frames, frames, xs)
         smooth_y = np.interp(all_frames, frames, ys)
@@ -2267,44 +2299,98 @@ def append_departure_point(
         return list(positions)
 
     result = list(positions)
-    tail = result[-min(_FIT_WINDOW, len(result)):]
+    tail = result[-min(_CURVE_FIT_WINDOW, len(result)):]
     frames_t = np.array([p.frame_index for p in tail], dtype=np.float64)
     xs_t = np.array([p.x_m for p in tail], dtype=np.float64)
     ys_t = np.array([p.y_m for p in tail], dtype=np.float64)
 
-    vx = _linear_slope(frames_t, xs_t)
-    vy = _linear_slope(frames_t, ys_t)
+    fit_n = min(_FIT_WINDOW, len(frames_t))
+    vy = _linear_slope(frames_t[-fit_n:], ys_t[-fit_n:])
 
-    if float(np.hypot(vx, vy)) < 1e-4:
+    if abs(vy) < 1e-4:
         return result
 
     last = result[-1]
     x_lo = -_X_MARGIN
     x_hi = lane_width_m + _X_MARGIN
 
-    for df in range(1, 61):
-        x = last.x_m + vx * df
-        y = last.y_m + vy * df
-        if x < x_lo or x > x_hi or y > lane_length_m or y < 0.0:
-            safe_fps = max(fps, 1e-6)
-            dep_frame = last.frame_index + df
-            result.append(
-                BallPos(
-                    frame_index=dep_frame,
-                    timestamp_s=float(dep_frame / safe_fps),
-                    x_m=float(np.clip(x, x_lo, x_hi)),
-                    y_m=float(np.clip(y, 0.0, lane_length_m)),
-                )
-            )
-            logger.info(
-                "Departure point: frame %d (x=%.3f y=%.3f)",
-                dep_frame,
-                result[-1].x_m,
-                result[-1].y_m,
-            )
-            break
+    target_y = lane_length_m
+    if last.y_m >= lane_length_m - 0.02:
+        return result
+
+    target_x = _predict_curve_x_at_y(
+        ys_t,
+        xs_t,
+        target_y=target_y,
+        last_x=last.x_m,
+    )
+    target_x = float(np.clip(target_x, last.x_m - _MAX_DEPARTURE_DX_M, last.x_m + _MAX_DEPARTURE_DX_M))
+    target_x = float(np.clip(target_x, x_lo, x_hi))
+
+    frames_per_m = 1.0 / max(vy, 1e-4)
+    df = int(np.clip(round((target_y - last.y_m) * frames_per_m), 1, 60))
+    dep_frame = last.frame_index + df
+    safe_fps = max(fps, 1e-6)
+    result.append(
+        BallPos(
+            frame_index=dep_frame,
+            timestamp_s=float(dep_frame / safe_fps),
+            x_m=target_x,
+            y_m=float(target_y),
+        )
+    )
+    logger.info(
+        "Departure point: frame %d (x=%.3f y=%.3f, curve_fit=True)",
+        dep_frame,
+        result[-1].x_m,
+        result[-1].y_m,
+    )
 
     return result
+
+
+def _predict_curve_x_at_y(
+    ys: np.ndarray,
+    xs: np.ndarray,
+    *,
+    target_y: float,
+    last_x: float,
+) -> float:
+    if len(ys) < 2:
+        return float(last_x)
+
+    order = np.argsort(ys)
+    y_sorted = ys[order].astype(np.float64)
+    x_sorted = xs[order].astype(np.float64)
+
+    unique_y: List[float] = []
+    unique_x: List[float] = []
+    for y in np.unique(y_sorted):
+        vals = x_sorted[np.abs(y_sorted - y) < 1e-9]
+        unique_y.append(float(y))
+        unique_x.append(float(np.median(vals)))
+
+    y = np.asarray(unique_y, dtype=np.float64)
+    x = np.asarray(unique_x, dtype=np.float64)
+    if y.size < 2:
+        return float(last_x)
+
+    y_span = float(y[-1] - y[0])
+    if y_span < 0.35:
+        return float(last_x)
+
+    linear = np.polyfit(y, x, 1)
+    x_linear = float(np.polyval(linear, target_y))
+    if y.size < 5 or y_span < 1.0:
+        return x_linear
+
+    quad = np.polyfit(y, x, 2)
+    x_quad = float(np.polyval(quad, target_y))
+    curvature = abs(float(quad[0]))
+    if not np.isfinite(x_quad) or curvature > 0.08:
+        return x_linear
+
+    return float(0.65 * x_quad + 0.35 * x_linear)
 
 
 def describe_processing_stages(
@@ -2665,24 +2751,39 @@ def run_lane_ball_postprocessing(
         for sel in track_selections
     }
     max_ball_score = max((sel.ball_score for sel in track_selections), default=0.0)
-    if max_ball_score >= 0.08:
+    strong_ball_score_threshold = 0.35
+    if max_ball_score >= strong_ball_score_threshold:
         selected_track = max(
             track_selections,
             key=lambda sel: 0.35 * sel.lane_quality + 0.65 * sel.ball_score,
         )
+        selection_sort_key = lambda item: 0.35 * item.lane_quality + 0.65 * item.ball_score
+        selection_reason = "strong_ball_projection"
     else:
-        selected_track = max(track_selections, key=lambda sel: sel.lane_quality)
+        selected_track = max(
+            track_selections,
+            key=lambda sel: (
+                sel.lane_quality + 0.03 * min(sel.track.ball_votes, 12) / 12.0,
+                _track_average_area(sel.track),
+                float(sel.track.seen_count),
+            ),
+        )
+        selection_sort_key = (
+            lambda item: item.lane_quality
+            + 0.03 * min(item.track.ball_votes, 12) / 12.0
+        )
+        selection_reason = "lane_quality_low_ball_projection"
 
     active_lane = selected_track.track
     matched_observations = selected_track.matched_observations
     src_corners = selected_track.src_corners
     homography = cv2.getPerspectiveTransform(src_corners, dst)
 
-    print("  lane track selection:")
+    print(f"  lane track selection ({selection_reason} max_ball_q={max_ball_score:.3f}):")
     for idx, sel in enumerate(
         sorted(
             track_selections,
-            key=lambda item: 0.35 * item.lane_quality + 0.65 * item.ball_score,
+            key=selection_sort_key,
             reverse=True,
         )[:8]
     ):

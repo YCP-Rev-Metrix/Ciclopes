@@ -1692,13 +1692,28 @@ def run_lane_ball_postprocessing(
         for sel in track_selections
     }
     max_ball_score = max((sel.ball_score for sel in track_selections), default=0.0)
-    if max_ball_score >= 0.08:
+    strong_ball_score_threshold = 0.35
+    if max_ball_score >= strong_ball_score_threshold:
         selected_track = max(
             track_selections,
             key=lambda sel: 0.35 * sel.lane_quality + 0.65 * sel.ball_score,
         )
+        selection_sort_key = lambda item: 0.35 * item.lane_quality + 0.65 * item.ball_score
+        selection_reason = "strong_ball_projection"
     else:
-        selected_track = max(track_selections, key=lambda sel: sel.lane_quality)
+        selected_track = max(
+            track_selections,
+            key=lambda sel: (
+                sel.lane_quality + 0.03 * min(sel.track.ball_votes, 12) / 12.0,
+                _track_average_area(sel.track),
+                float(sel.track.seen_count),
+            ),
+        )
+        selection_sort_key = (
+            lambda item: item.lane_quality
+            + 0.03 * min(item.track.ball_votes, 12) / 12.0
+        )
+        selection_reason = "lane_quality_low_ball_projection"
 
     active_lane = selected_track.track
     matched_observations = selected_track.matched_observations
@@ -1706,7 +1721,9 @@ def run_lane_ball_postprocessing(
     homography = cv2.getPerspectiveTransform(src_corners, dst)
 
     logger.info(
-        "Lane track selection: %s",
+        "Lane track selection (%s max_ball_q=%.3f): %s",
+        selection_reason,
+        max_ball_score,
         " | ".join(
             f"lane_q={sel.lane_quality:.3f} ball_q={sel.ball_score:.3f} "
             f"gated_ball_q={selection_metrics[id(sel)][3]:.3f} "
@@ -1722,7 +1739,7 @@ def run_lane_ball_postprocessing(
             f"best_frame={sel.track.best_frame_idx}"
             for sel in sorted(
                 track_selections,
-                key=lambda item: 0.35 * item.lane_quality + 0.65 * item.ball_score,
+                key=selection_sort_key,
                 reverse=True,
             )[:8]
         ),

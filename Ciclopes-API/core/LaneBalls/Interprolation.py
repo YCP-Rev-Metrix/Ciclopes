@@ -80,6 +80,24 @@ def _spread_flat_forward_segments(values: np.ndarray) -> np.ndarray:
     return np.maximum.accumulate(out)
 
 
+def _anchor_endpoint_values(
+    smooth: np.ndarray,
+    raw: np.ndarray,
+    *,
+    anchor_len: int = 5,
+) -> np.ndarray:
+    if smooth.size <= 2 or raw.size != smooth.size:
+        return smooth.astype(np.float64, copy=True)
+
+    out = smooth.astype(np.float64, copy=True)
+    n = min(anchor_len, out.size)
+    front_weights = np.linspace(1.0, 0.0, n)
+    back_weights = np.linspace(0.0, 1.0, n)
+    out[:n] = front_weights * raw[:n] + (1.0 - front_weights) * out[:n]
+    out[-n:] = back_weights * raw[-n:] + (1.0 - back_weights) * out[-n:]
+    return out
+
+
 def interpolate_ball_positions(
     positions: List[BallPos],
     fps: float,
@@ -138,6 +156,10 @@ def interpolate_ball_positions(
         spline_y = UnivariateSpline(frames, ys, k=3, s=s)
         smooth_x = spline_x(all_frames)
         smooth_y = spline_y(all_frames)
+        raw_x = np.interp(all_frames, frames, xs)
+        raw_y = np.interp(all_frames, frames, ys)
+        smooth_x = _anchor_endpoint_values(np.asarray(smooth_x, dtype=np.float64), raw_x)
+        smooth_y = _anchor_endpoint_values(np.asarray(smooth_y, dtype=np.float64), raw_y)
     else:
         # Too few points for a meaningful smooth — linear fallback
         smooth_x = np.interp(all_frames, frames, xs)

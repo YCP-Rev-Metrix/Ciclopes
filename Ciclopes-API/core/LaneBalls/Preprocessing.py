@@ -9,6 +9,7 @@ import numpy as np
 
 # Matches pipeline_v2 yolo26n-seg class semantics.
 YOLO_CLASS_NAME_BY_ID: Dict[int, str] = {0: "ball", 1: "lane", 2: "pins"}
+MAX_LANE_MASKS_PER_FRAME = 4
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,13 @@ def extract_frame_segmentation(result: Any) -> FrameSegmentation:
             lane_masks.append(mask)
         elif cls_id == 2:
             pins_masks.append(mask)
+
+    if len(lane_masks) > MAX_LANE_MASKS_PER_FRAME:
+        lane_masks = sorted(
+            lane_masks,
+            key=lambda m: int(np.count_nonzero(m)),
+            reverse=True,
+        )[:MAX_LANE_MASKS_PER_FRAME]
 
     return FrameSegmentation(
         ball_masks=ball_masks,

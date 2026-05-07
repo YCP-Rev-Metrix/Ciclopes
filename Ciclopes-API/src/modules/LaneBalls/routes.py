@@ -114,7 +114,7 @@ async def _run_lane_ball_pipeline_inner(request: Request, payload: LaneBallRunIn
         split_video = split_video_into_frames(
             str(temp_path),
             max_frames=settings.max_video_frames,
-            max_dimension=settings.max_video_dimension,
+            max_dimension=settings.lane_ball_max_video_dimension,
         )
 
     if not split_video.frames:
@@ -122,9 +122,11 @@ async def _run_lane_ball_pipeline_inner(request: Request, payload: LaneBallRunIn
         return _empty_output()
 
     fps = float(split_video.fps) if split_video.fps > 0 else 30.0
-    rgb_frames = [cv2.cvtColor(vf.image, cv2.COLOR_BGR2RGB) for vf in split_video.frames]
+    rgb_frames = []
+    for vf in split_video.frames:
+        rgb_frames.append(cv2.cvtColor(vf.image, cv2.COLOR_BGR2RGB))
+        vf.image = None
 
-    # Free the raw BGR frames — we only need rgb_frames from here on
     split_video.frames.clear()
     del split_video
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -292,31 +293,30 @@ class InferenceEngine:
         batch_size: int = 32,
     ) -> dict[str, Any]:
         inference_t0 = time.perf_counter()
-        # Chunk frames to respect batch_size and avoid VRAM spikes
-        raw_results = []
+        segmentations_by_frame = {}
+        total_ball_masks = 0
+        total_lane_masks = 0
+
         for i in range(0, len(frames_rgb), batch_size):
             chunk = frames_rgb[i : i + batch_size]
-            raw_results.extend(self.lane_ball.infer_batch(chunk))
+            batch_results = self.lane_ball.infer_batch(chunk)
+            for offset, result in enumerate(batch_results):
+                frame_idx = i + offset
+                frame_seg = extract_frame_segmentation(result)
+                segmentations_by_frame[frame_idx] = frame_seg
+                total_ball_masks += len(frame_seg.ball_masks)
+                total_lane_masks += len(frame_seg.lane_masks)
+            del batch_results
             torch.cuda.empty_cache()
         inference_ms = (time.perf_counter() - inference_t0) * 1000.0
+        frames_rgb.clear()
+        del frames_rgb
+        gc.collect()
 
-        segmentations_by_frame = {
-            idx: extract_frame_segmentation(res) for idx, res in enumerate(raw_results)
-        }
-
-        total_ball_masks = sum(len(s.ball_masks) for s in segmentations_by_frame.values())
-        total_lane_masks = sum(len(s.lane_masks) for s in segmentations_by_frame.values())
         logger.info(
             "Segmentation extraction: %d frames, %d total ball masks, %d total lane masks",
             len(segmentations_by_frame), total_ball_masks, total_lane_masks,
         )
-
-        # Build BGR copies for postprocessing (trapezoid refinement needs pixel data)
-        frames_bgr = [
-            np.ascontiguousarray(frame[:, :, ::-1]) for frame in frames_rgb
-        ]
-        # Free the RGB copies — postprocessing only uses BGR
-        frames_rgb.clear()
 
         post_t0 = time.perf_counter()
         try:
@@ -325,19 +325,20 @@ class InferenceEngine:
                 fps=fps,
                 start_frame=0,
                 ball_start_frame=start_frame,
-                frames_bgr=frames_bgr,
+                frames_bgr=None,
             )
         except Exception:
             logger.exception("Postprocessing failed — returning empty results")
             post_ms = (time.perf_counter() - post_t0) * 1000.0
+            segmentations_by_frame.clear()
+            gc.collect()
             return self._empty_lane_ball_result(
                 inference_ms=round(inference_ms, 2),
                 postprocess_ms=round(post_ms, 2),
             )
-        finally:
-            frames_bgr.clear()
-            del frames_bgr
         post_ms = (time.perf_counter() - post_t0) * 1000.0
+        segmentations_by_frame.clear()
+        gc.collect()
 
         # ── Trim → Interpolate → Departure → Kinematics ─────────────────
         raw_positions = post.ball_positions.ball_positions

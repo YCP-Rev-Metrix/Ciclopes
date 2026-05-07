@@ -21,8 +21,10 @@ _STEP_DROP_RATIO = 0.25
 # Minimum detections needed to establish a running median step size.
 _MIN_HISTORY = 3
 
-# How many trailing points to fit the departure line from.
+# How many trailing points to fit the departure curve from.
 _FIT_WINDOW = 5
+_CURVE_FIT_WINDOW = 14
+_MAX_DEPARTURE_DX_M = 0.28
 
 _CONTACT_Y_TOL_M = 0.08
 _END_Y_TOL_M = 0.35
@@ -228,42 +230,95 @@ def append_departure_point(
 
     result = list(positions)
 
-    tail = result[-min(_FIT_WINDOW, len(result)):]
+    tail = result[-min(_CURVE_FIT_WINDOW, len(result)):]
     frames_t = np.array([p.frame_index for p in tail], dtype=np.float64)
     xs_t = np.array([p.x_m for p in tail], dtype=np.float64)
     ys_t = np.array([p.y_m for p in tail], dtype=np.float64)
 
-    vx = _linear_slope(frames_t, xs_t)
-    vy = _linear_slope(frames_t, ys_t)
-
-    if float(np.hypot(vx, vy)) < 1e-4:
+    vy = _linear_slope(frames_t[-min(_FIT_WINDOW, len(frames_t)):], ys_t[-min(_FIT_WINDOW, len(ys_t)):])
+    if abs(vy) < 1e-4:
         return result
 
     last = result[-1]
     x_lo = -_X_MARGIN
     x_hi = lane_width_m + _X_MARGIN
 
-    for df in range(1, 61):
-        x = last.x_m + vx * df
-        y = last.y_m + vy * df
-        if x < x_lo or x > x_hi or y > lane_length_m or y < 0.0:
-            safe_fps = max(fps, 1e-6)
-            dep_frame = last.frame_index + df
-            result.append(
-                BallPos(
-                    frame_index=dep_frame,
-                    timestamp_s=float(dep_frame / safe_fps),
-                    x_m=float(np.clip(x, x_lo, x_hi)),
-                    y_m=float(np.clip(y, 0.0, lane_length_m)),
-                )
-            )
-            logger.info(
-                "Departure point: frame %d (x=%.3f y=%.3f)",
-                dep_frame, result[-1].x_m, result[-1].y_m,
-            )
-            break
+    target_y = lane_length_m
+    if last.y_m >= lane_length_m - 0.02:
+        return result
+
+    target_x = _predict_curve_x_at_y(
+        ys_t,
+        xs_t,
+        target_y=target_y,
+        last_x=last.x_m,
+    )
+
+    target_x = float(np.clip(target_x, last.x_m - _MAX_DEPARTURE_DX_M, last.x_m + _MAX_DEPARTURE_DX_M))
+    target_x = float(np.clip(target_x, x_lo, x_hi))
+
+    frames_per_m = 1.0 / max(vy, 1e-4)
+    df = int(np.clip(round((target_y - last.y_m) * frames_per_m), 1, 60))
+    dep_frame = last.frame_index + df
+    safe_fps = max(fps, 1e-6)
+    result.append(
+        BallPos(
+            frame_index=dep_frame,
+            timestamp_s=float(dep_frame / safe_fps),
+            x_m=target_x,
+            y_m=float(target_y),
+        )
+    )
+    logger.info(
+        "Departure point: frame %d (x=%.3f y=%.3f, curve_fit=True)",
+        dep_frame, result[-1].x_m, result[-1].y_m,
+    )
 
     return result
+
+
+def _predict_curve_x_at_y(
+    ys: np.ndarray,
+    xs: np.ndarray,
+    *,
+    target_y: float,
+    last_x: float,
+) -> float:
+    if len(ys) < 2:
+        return float(last_x)
+
+    order = np.argsort(ys)
+    y_sorted = ys[order].astype(np.float64)
+    x_sorted = xs[order].astype(np.float64)
+
+    unique_y: List[float] = []
+    unique_x: List[float] = []
+    for y in np.unique(y_sorted):
+        vals = x_sorted[np.abs(y_sorted - y) < 1e-9]
+        unique_y.append(float(y))
+        unique_x.append(float(np.median(vals)))
+
+    y = np.asarray(unique_y, dtype=np.float64)
+    x = np.asarray(unique_x, dtype=np.float64)
+    if y.size < 2:
+        return float(last_x)
+
+    y_span = float(y[-1] - y[0])
+    if y_span < 0.35:
+        return float(last_x)
+
+    linear = np.polyfit(y, x, 1)
+    x_linear = float(np.polyval(linear, target_y))
+    if y.size < 5 or y_span < 1.0:
+        return x_linear
+
+    quad = np.polyfit(y, x, 2)
+    x_quad = float(np.polyval(quad, target_y))
+    curvature = abs(float(quad[0]))
+    if not np.isfinite(x_quad) or curvature > 0.08:
+        return x_linear
+
+    return float(0.65 * x_quad + 0.35 * x_linear)
 
 
 def _linear_slope(frames: np.ndarray, values: np.ndarray) -> float:
