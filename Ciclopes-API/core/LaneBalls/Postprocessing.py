@@ -1092,25 +1092,52 @@ def _masks_to_boxes(masks: Sequence[np.ndarray]) -> List[np.ndarray]:
     return boxes
 
 
-def _ball_contact_point_from_mask(ball_mask: np.ndarray) -> Optional[tuple[float, float]]:
-    ys, xs = np.where(ball_mask > 0)
-    if xs.size == 0:
-        return None
+def _ball_contact_point_from_mask(
+    ball_mask: np.ndarray,
+) -> Optional[tuple[tuple[float, float], float]]:
+    """Return ((x_contact, y_contact), area) or None.
 
-    # Use the bottom of the mask for y and the horizontal center of the full
-    # bounding box for x.  Using only xs at y == y_contact is fragile: the
-    # bottom-most row may contain just one or two pixels at a corner of the
-    # detection, shifting x away from the true bottom-middle.
-    y_contact = float(np.max(ys))
-    x_contact = float(np.min(xs) + np.max(xs)) / 2.0
-    return x_contact, y_contact
+    Avoids np.where(mask>0) which materializes every (y,x) pair; row/col-any
+    on the binary mask is much cheaper on full-resolution frames.
+    """
+    bin_mask = ball_mask > 0
+    rows_any = np.any(bin_mask, axis=1)
+    if not rows_any.any():
+        return None
+    cols_any = np.any(bin_mask, axis=0)
+
+    row_idx = np.flatnonzero(rows_any)
+    col_idx = np.flatnonzero(cols_any)
+
+    y_contact = float(row_idx[-1])  # bottom of mask
+    x_contact = float(col_idx[0] + col_idx[-1]) / 2.0
+    area = float(np.count_nonzero(bin_mask))
+    return (x_contact, y_contact), area
+
+
+# Per-frame cache: id(frame_seg) -> list of (contact_xy, area) for each ball
+# mask. Cleared at the start of each postprocessing run.
+_BALL_FRAME_CACHE: Dict[int, List[Optional[tuple[tuple[float, float], float]]]] = {}
+
+
+def _ball_cache_for_frame(frame_seg: "FrameSegmentation") -> List[Optional[tuple[tuple[float, float], float]]]:
+    key = id(frame_seg)
+    cached = _BALL_FRAME_CACHE.get(key)
+    if cached is not None:
+        return cached
+    entries: List[Optional[tuple[tuple[float, float], float]]] = []
+    for mask in frame_seg.ball_masks:
+        entries.append(_ball_contact_point_from_mask(mask))
+    _BALL_FRAME_CACHE[key] = entries
+    return entries
 
 
 def _choose_ball_contact_for_lane(
-    ball_masks: Sequence[np.ndarray],
+    frame_seg: "FrameSegmentation",
     lane_polygon: np.ndarray,
 ) -> Optional[tuple[float, float]]:
-    if not ball_masks:
+    cache = _ball_cache_for_frame(frame_seg)
+    if not cache:
         return None
 
     lane_poly = lane_polygon.reshape((-1, 1, 2)).astype(np.float32)
@@ -1119,19 +1146,17 @@ def _choose_ball_contact_for_lane(
     best_point: Optional[tuple[float, float]] = None
     best_key: Optional[tuple[float, float, float, float]] = None
 
-    for mask in ball_masks:
-        contact = _ball_contact_point_from_mask(mask)
-        if contact is None:
+    for entry in cache:
+        if entry is None:
             continue
+        (x_contact, y_contact), area = entry
 
-        x_contact, y_contact = contact
         inside = cv2.pointPolygonTest(
             lane_poly,
             (float(x_contact), float(y_contact)),
             measureDist=False,
         ) >= 0
 
-        area = float(np.count_nonzero(mask))
         key = (
             0.0 if inside else 1.0,
             -float(y_contact),
@@ -1162,14 +1187,20 @@ def _project_ball_positions_for_lane(
     ball_start_frame: int,
     src_corners: np.ndarray,
     homography: np.ndarray,
+    sorted_frames: Optional[Sequence[int]] = None,
 ) -> List[BallPos]:
     positions: List[BallPos] = []
-    for frame_index in sorted(segmentations_by_frame.keys()):
+    if sorted_frames is None:
+        sorted_frames = sorted(segmentations_by_frame.keys())
+    safe_fps = max(fps, 1e-6)
+    for frame_index in sorted_frames:
         if frame_index < ball_start_frame:
             continue
 
         frame_seg = segmentations_by_frame[frame_index]
-        contact = _choose_ball_contact_for_lane(frame_seg.ball_masks, src_corners)
+        if not frame_seg.ball_masks:
+            continue
+        contact = _choose_ball_contact_for_lane(frame_seg, src_corners)
         if contact is None:
             continue
 
@@ -1177,7 +1208,7 @@ def _project_ball_positions_for_lane(
         positions.append(
             BallPos(
                 frame_index=int(frame_index),
-                timestamp_s=float(frame_index / max(fps, 1e-6)),
+                timestamp_s=float(frame_index / safe_fps),
                 x_m=float(x_m),
                 y_m=float(y_m),
             )
@@ -1522,7 +1553,12 @@ def run_lane_ball_postprocessing(
         logger.warning("No segmentations provided — returning empty results")
         return _empty_result()
 
-    sorted_frames = sorted(k for k in segmentations_by_frame.keys() if k >= start_frame)
+    # Reset per-frame ball-mask cache for this run (precomputed on demand
+    # inside _ball_cache_for_frame, shared across all track projections).
+    _BALL_FRAME_CACHE.clear()
+
+    all_sorted_frames = sorted(segmentations_by_frame.keys())
+    sorted_frames = [k for k in all_sorted_frames if k >= start_frame]
     if not sorted_frames:
         logger.warning("No frames >= start_frame=%d — returning empty results", start_frame)
         return _empty_result()
@@ -1669,6 +1705,7 @@ def run_lane_ball_postprocessing(
             ball_start_frame,
             src_corners,
             homography,
+            sorted_frames=all_sorted_frames,
         )
         track_selections.append(
             LaneTrackSelection(
@@ -1796,6 +1833,8 @@ def run_lane_ball_postprocessing(
         homography_condition_number=cond,
         mean_lane_coverage_ratio=float(np.mean(coverage_values)) if coverage_values else 0.0,
     )
+
+    _BALL_FRAME_CACHE.clear()
 
     return PostprocessResult(
         ball_positions=BallPosList(ball_positions=positions),
