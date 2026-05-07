@@ -132,7 +132,7 @@ async def _run_lane_ball_pipeline_inner(request: Request, payload: LaneBallRunIn
 
     # ── Determine start frame from sensor data (or use default) ───────────
     lb_start_frame = settings.lane_ball_start_frame
-    if payload.sd_key != "key":
+    if payload.sd_key != "key" and not settings.force_lane_ball_start_frame:
         logger.info("Fetching sensor JSON from bucket: sd_key=%s", payload.sd_key)
         try:
             sensor_data = query_json_via_api(

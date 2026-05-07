@@ -92,7 +92,7 @@ async def run_aggregate_pipeline(request: Request, payload: AggRunInput):
     rgb_frames = [cv2.cvtColor(vf.image, cv2.COLOR_BGR2RGB) for vf in split_video.frames]
 
     # ── Determine frame ranges from sensor data (or use defaults) ─────────
-    use_sensor = payload.sd_key != "key"
+    use_sensor = payload.sd_key != "key" and not settings.force_lane_ball_start_frame
     lb_start_frame = settings.lane_ball_start_frame
     fourdbody_frames = rgb_frames
 

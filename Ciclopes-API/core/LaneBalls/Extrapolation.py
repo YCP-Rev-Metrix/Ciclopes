@@ -431,7 +431,7 @@ def _predict_curve_x_at_y(
 
     # If the quadratic curvature direction agrees with the recent dx trend
     # AND with the committed global hook, lean harder on the quadratic.
-    quad_blend = 0.75  # bumped from 0.65 — slightly more curve credit
+    quad_blend = 0.70  # base curve credit — calmed slightly to avoid overshoot
     exaggerate = 0.0   # extra push past the quadratic when hook confirmed
     if y.size >= 6:
         tail_n = max(3, y.size // 3)
@@ -449,13 +449,12 @@ def _predict_curve_x_at_y(
                 and curvature_signed * hook_sign > 0.0
             )
             if curvature_agrees and abs(slope_delta) > 0.02:
-                quad_blend = 0.90
+                quad_blend = 0.82
             if global_agrees:
                 # Push slightly past the quadratic prediction in the same
-                # direction the ball is already curving — this captures the
-                # late-stage hook acceleration that a 2nd-order fit under-
-                # predicts. 15% of the deviation from the linear baseline.
-                exaggerate = 0.15
+                # direction the ball is already curving. Calmed from 0.15 to
+                # 0.06 — strong hooks were over-shooting by ~a pin.
+                exaggerate = 0.06
 
     blended = quad_blend * x_quad + (1.0 - quad_blend) * x_linear
     if exaggerate != 0.0:

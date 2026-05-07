@@ -15,7 +15,8 @@ class AppSettings:
     presign_ttl_seconds: int = 3600
     lane_ball_batch_size: int = 32
     sam3d_body_batch_size: int = 4
-    lane_ball_start_frame: int = 40  # demo default — skip first N frames
+    lane_ball_start_frame: int = 270  # demo default — skip first N frames
+    force_lane_ball_start_frame: bool = False  # if True, ignore sd_key sensor-derived start and always use lane_ball_start_frame
     max_video_frames: int = 600     # OOM protection: cap extracted frames
     max_video_dimension: int = 1024 # OOM protection: downscale longest edge
     lane_ball_max_video_dimension: int = 1280
@@ -98,6 +99,9 @@ def load_app_settings() -> AppSettings:
         lb_max_dim = 1280
 
     multi_gpu = _parse_bool(_env("MULTI_GPU", default="false"), default=False)
+    force_lb_start = _parse_bool(
+        _env("FORCE_LANE_BALL_START_FRAME", default="false"), default=False
+    )
 
     return AppSettings(
         api_base=_env("API_BASE", "api_base", default="https://api.revmetrix.io"),
@@ -114,4 +118,5 @@ def load_app_settings() -> AppSettings:
         max_video_dimension=max_dim,
         lane_ball_max_video_dimension=lb_max_dim,
         multi_gpu=multi_gpu,
+        force_lane_ball_start_frame=force_lb_start,
     )
