@@ -190,6 +190,30 @@ def interpolate_ball_positions(
         except Exception:
             pass
 
+    # ── Hook-inertia tail clamp ──────────────────────────────────────────
+    # If the trajectory has a clearly committed hook (significant Δx over a
+    # significant Δy in the middle 60%), the last few samples cannot reverse
+    # that direction — bowling-ball inertia. Freeze any per-sample dx that
+    # would go against the committed hook in the last ~12% of samples.
+    sm = np.asarray(smooth_x, dtype=np.float64)
+    sy = np.asarray(smooth_y, dtype=np.float64)
+    if sm.size >= 12:
+        lo = int(sm.size * 0.20)
+        hi = int(sm.size * 0.80)
+        if hi > lo + 4:
+            global_dx = float(sm[hi] - sm[lo])
+            global_dy = float(sy[hi] - sy[lo])
+            if abs(global_dx) >= 0.04 and global_dy > 1.0:
+                hook_sign = 1.0 if global_dx > 0 else -1.0
+                tail_start = max(hi, sm.size - max(6, sm.size // 8))
+                for i in range(tail_start + 1, sm.size):
+                    step = sm[i] - sm[i - 1]
+                    # Allow tiny noise in either direction; only freeze when
+                    # the step clearly reverses the committed hook.
+                    if step * hook_sign < -1e-3:
+                        sm[i] = sm[i - 1]
+    smooth_x = sm
+
     safe_fps = max(fps, 1e-6)
     dense: List[BallPos] = []
     for i, f in enumerate(all_frames):

@@ -23,8 +23,8 @@ _MIN_HISTORY = 3
 
 # How many trailing points to fit the departure curve from.
 _FIT_WINDOW = 5
-_CURVE_FIT_WINDOW = 14
-_MAX_DEPARTURE_DX_M = 0.28
+_CURVE_FIT_WINDOW = 18
+_MAX_DEPARTURE_DX_M = 0.36
 
 _CONTACT_Y_TOL_M = 0.08
 _END_Y_TOL_M = 0.35
@@ -386,18 +386,87 @@ def _predict_curve_x_at_y(
     if y_span < 0.35:
         return float(last_x)
 
-    linear = np.polyfit(y, x, 1)
+    # Tail-weighted least-squares: the late (more-curved) part of a hook is
+    # what continues to the pins, so weight recent samples more heavily.
+    weights = np.linspace(0.5, 1.5, y.size)
+
+    linear = np.polyfit(y, x, 1, w=weights)
     x_linear = float(np.polyval(linear, target_y))
+
+    # ── Committed hook direction (inertia) ─────────────────────────────
+    # A bowling ball cannot reverse hook direction in the last fraction of
+    # the trajectory — too much inertia. Detect the *committed* direction
+    # from the long baseline (early-third median x → late-third median x)
+    # and use it to (a) reject prediction reversals, (b) exaggerate when a
+    # real hook is present.
+    hook_sign = 0.0
+    hook_strength = 0.0
+    if y.size >= 9:
+        third = y.size // 3
+        early_x = float(np.median(x[:third]))
+        late_x = float(np.median(x[-third:]))
+        global_dx = late_x - early_x
+        early_y = float(np.median(y[:third]))
+        late_y = float(np.median(y[-third:]))
+        global_dy = late_y - early_y
+        if abs(global_dx) >= 0.04 and global_dy > 1.0:
+            hook_sign = 1.0 if global_dx > 0 else -1.0
+            hook_strength = abs(global_dx)
+
     if y.size < 5 or y_span < 1.0:
+        # Even in the linear-only branch, don't allow predictions that
+        # reverse a clearly committed hook.
+        if hook_sign != 0.0 and (x_linear - float(last_x)) * hook_sign < 0.0:
+            return float(last_x)
         return x_linear
 
-    quad = np.polyfit(y, x, 2)
+    quad = np.polyfit(y, x, 2, w=weights)
     x_quad = float(np.polyval(quad, target_y))
-    curvature = abs(float(quad[0]))
-    if not np.isfinite(x_quad) or curvature > 0.08:
+    curvature_signed = float(quad[0])
+    curvature = abs(curvature_signed)
+    if not np.isfinite(x_quad) or curvature > 0.20:
+        if hook_sign != 0.0 and (x_linear - float(last_x)) * hook_sign < 0.0:
+            return float(last_x)
         return x_linear
 
-    return float(0.65 * x_quad + 0.35 * x_linear)
+    # If the quadratic curvature direction agrees with the recent dx trend
+    # AND with the committed global hook, lean harder on the quadratic.
+    quad_blend = 0.75  # bumped from 0.65 — slightly more curve credit
+    exaggerate = 0.0   # extra push past the quadratic when hook confirmed
+    if y.size >= 6:
+        tail_n = max(3, y.size // 3)
+        tail_dx = float(x[-1] - x[-tail_n])
+        tail_dy = float(y[-1] - y[-tail_n])
+        if abs(tail_dy) > 1e-6:
+            recent_slope = tail_dx / tail_dy
+            full_slope = float(linear[0])
+            slope_delta = recent_slope - full_slope
+            curvature_agrees = curvature_signed * slope_delta > 0.0
+            # Hook is "confirmed" when curvature, recent slope deviation,
+            # and the global committed direction all agree.
+            global_agrees = (
+                hook_sign != 0.0
+                and curvature_signed * hook_sign > 0.0
+            )
+            if curvature_agrees and abs(slope_delta) > 0.02:
+                quad_blend = 0.90
+            if global_agrees:
+                # Push slightly past the quadratic prediction in the same
+                # direction the ball is already curving — this captures the
+                # late-stage hook acceleration that a 2nd-order fit under-
+                # predicts. 15% of the deviation from the linear baseline.
+                exaggerate = 0.15
+
+    blended = quad_blend * x_quad + (1.0 - quad_blend) * x_linear
+    if exaggerate != 0.0:
+        blended = blended + exaggerate * (x_quad - x_linear)
+
+    # Inertia: never let the prediction reverse the committed hook.
+    if hook_sign != 0.0:
+        if (blended - float(last_x)) * hook_sign < 0.0:
+            blended = float(last_x)
+
+    return float(blended)
 
 
 def _linear_slope(frames: np.ndarray, values: np.ndarray) -> float:
