@@ -1,0 +1,12 @@
+# Exported mobile model is generated from the private/checkpoint weights.
+mobile/models/*.onnx
+mobile/capacitor-plugin/android/src/main/assets/*.onnx
+
+# Local Mac environment used for mobile model export.
+.venv-mobile/
+node_modules/
+mobile/capacitor-plugin/dist/
+
+# Android/Gradle build output
+.gradle/
+**/build/

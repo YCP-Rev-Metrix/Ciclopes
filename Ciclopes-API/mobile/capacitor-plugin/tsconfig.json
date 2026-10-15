@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "declaration": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "outDir": "dist/esm",
+    "rootDir": "src",
+    "target": "ES2017",
+    "strict": true
+  },
+  "include": ["src/**/*.ts"]
+}

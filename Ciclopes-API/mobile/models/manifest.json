@@ -1,0 +1,39 @@
+{
+  "model": "ciclopes_lane_ball.onnx",
+  "source_weights": "best_v2_26n.pt",
+  "task": "instance-segmentation",
+  "input": {
+    "name": "images",
+    "layout": "NCHW",
+    "color": "RGB",
+    "dtype": "float32",
+    "range": [
+      0,
+      1
+    ],
+    "imgsz": 640,
+    "letterbox": true
+  },
+  "classes": {
+    "0": "ball",
+    "1": "lane",
+    "2": "pins"
+  },
+  "output": {
+    "predictions": {
+      "name": "output0",
+      "shape": [1, 300, 38],
+      "layout": "BNC",
+      "row": "xyxy, confidence, class_id, 32 mask coefficients",
+      "classes": "YOLO26 end-to-end detections; no separate NMS stage"
+    },
+    "mask_prototypes": {
+      "name": "output1",
+      "shape": [1, 32, 160, 160],
+      "layout": "BCHW",
+      "decode": "sigmoid(sum(mask_coefficients * prototypes)); crop to detection box"
+    }
+  },
+  "opset": 17,
+  "nms_in_graph": false
+}

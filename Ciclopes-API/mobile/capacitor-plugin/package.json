@@ -1,0 +1,25 @@
+{
+  "name": "@revmetrix/ciclopes-lane-analysis",
+  "version": "0.1.0",
+  "description": "Android ONNX lane and ball inference bridge for Ciclopes",
+  "main": "dist/esm/index.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/esm/index.d.ts",
+  "files": ["android", "dist", "package.json", "README.md"],
+  "capacitor": {
+    "android": {
+      "src": "android"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build"
+  },
+  "peerDependencies": {
+    "@capacitor/core": ">=6.0.0 <9.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/core": "^8.0.0",
+    "typescript": "^5.0.0"
+  }
+}
